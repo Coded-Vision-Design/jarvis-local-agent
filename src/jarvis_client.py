@@ -1,0 +1,98 @@
+"""HTTP client for the Jarvis Next.js API. Handles the narrow set of endpoints
+the local agent talks to (poll, per-task writes). Bearer auth on every call."""
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import httpx
+
+from .config import settings
+
+log = logging.getLogger("jarvis-agent.client")
+
+
+class JarvisClient:
+    def __init__(self) -> None:
+        self.base = settings.jarvis_base.rstrip("/")
+        self._headers = {
+            "Authorization": f"Bearer {settings.jarvis_local_agent_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "jarvis-local-agent/0.1",
+        }
+        # One client, kept open. httpx pools connections.
+        self._http = httpx.AsyncClient(
+            base_url=self.base,
+            headers=self._headers,
+            timeout=httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0),
+        )
+
+    async def aclose(self) -> None:
+        await self._http.aclose()
+
+    async def claim_next(self) -> dict[str, Any] | None:
+        """Atomically claim the next queued delegated task. None if empty queue."""
+        r = await self._http.post("/api/tasks/local-agent/poll")
+        if r.status_code == 204:
+            return None
+        if r.status_code == 401:
+            log.error("local agent unauthorized — check JARVIS_LOCAL_AGENT_TOKEN matches Jarvis .env")
+            return None
+        r.raise_for_status()
+        return r.json().get("task")
+
+    async def append_run(
+        self,
+        task_id: int,
+        run_kind: str,
+        payload: dict[str, Any],
+        cost_pence: int | None = None,
+    ) -> None:
+        body: dict[str, Any] = {"kind": "run", "run_kind": run_kind, "payload": payload}
+        if cost_pence is not None:
+            body["cost_pence"] = cost_pence
+        r = await self._http.post(f"/api/tasks/{task_id}/local-agent", json=body)
+        if r.status_code >= 400:
+            log.warning("append_run %s failed: %s %s", run_kind, r.status_code, r.text[:200])
+
+    async def heartbeat(self, task_id: int) -> None:
+        r = await self._http.post(
+            f"/api/tasks/{task_id}/local-agent", json={"kind": "heartbeat"}
+        )
+        if r.status_code >= 400:
+            log.warning("heartbeat failed: %s %s", r.status_code, r.text[:200])
+
+    async def merge_metadata(self, task_id: int, patch: dict[str, Any]) -> None:
+        r = await self._http.post(
+            f"/api/tasks/{task_id}/local-agent",
+            json={"kind": "metadata", "patch": patch},
+        )
+        if r.status_code >= 400:
+            log.warning("merge_metadata failed: %s %s", r.status_code, r.text[:200])
+
+    async def set_status(
+        self,
+        task_id: int,
+        status: str,
+        spent_pence: int | None = None,
+        spent_tokens: int | None = None,
+    ) -> None:
+        body: dict[str, Any] = {"kind": "status", "status": status}
+        if spent_pence is not None:
+            body["spent_pence"] = spent_pence
+        if spent_tokens is not None:
+            body["spent_tokens"] = spent_tokens
+        r = await self._http.post(f"/api/tasks/{task_id}/local-agent", json=body)
+        if r.status_code >= 400:
+            log.warning("set_status %s failed: %s %s", status, r.status_code, r.text[:200])
+
+
+# Module-level singleton; lazily constructed.
+_client: JarvisClient | None = None
+
+
+def get_client() -> JarvisClient:
+    global _client
+    if _client is None:
+        _client = JarvisClient()
+    return _client

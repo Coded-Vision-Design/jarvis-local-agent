@@ -1,0 +1,10 @@
+# Whitelist of repos the local agent is allowed to clone and modify.
+# Format: bare repo names (no org prefix); assumed under github.com/codedvisiondesign/<name>.
+# Edited live — re-read from disk on every poll, no restart needed.
+repos:
+  - Jarvis
+  - cdv-vps-ops
+  - carlsongracieuk
+  - HalsteadBJJ
+  - icabjj
+  - seo-platform

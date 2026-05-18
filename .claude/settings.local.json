@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-ChildItem -Path \"C:\\\\Jarvis\\\\agent\" -Force | ForEach-Object { $_.FullName })",
+      "Bash(docker info *)",
+      "Bash(curl -s http://127.0.0.1:17920/health)",
+      "Bash(curl -s -o /dev/null -w '%{http_code}' -X POST https://jarvis.codedvisiondesign.co.uk/api/tasks/local-agent/poll -H 'Authorization: Bearer y5ugtPeW73EsJ2PD3n0QkAiLcAynLO9P13j4QAogus0UeUNIfWkhow' -H 'Content-Type: application/json')",
+      "Bash(git -c \"user.email=contact@codedvisiondesign.co.uk\" -c \"user.name=Coded Vision Design\" commit -m \"ci: add Discord + JARVIS_LOCAL_AGENT_TOKEN to sync-secrets workflow\")",
+      "Bash(curl -sf http://127.0.0.1:17920/health)",
+      "PowerShell(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader)"
+    ]
+  }
+}

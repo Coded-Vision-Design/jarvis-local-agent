@@ -1,0 +1,46 @@
+services:
+  jarvis-agent:
+    build: .
+    image: jarvis-local-agent:latest
+    container_name: jarvis-agent
+    restart: unless-stopped
+    # Dedicated out-of-range port to dodge conflicts with XAMPP (80/443/3306),
+    # common dev servers (3000s, 5000s, 8000s, 8080), Ollama (11434), Postgres
+    # (5432), Redis (6379). Bound to loopback only — never exposed on LAN.
+    ports:
+      - "127.0.0.1:17920:17920"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Reach the public Jarvis server for task polling + writeback.
+      JARVIS_BASE: ${JARVIS_BASE:-https://jarvis.codedvisiondesign.co.uk}
+      JARVIS_LOCAL_AGENT_TOKEN: ${JARVIS_LOCAL_AGENT_TOKEN}
+      # Anthropic key for Claude Code headless. Used only when backend=claude.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      # OpenAI-compatible endpoint for the local Qwen3-Coder served by vLLM on
+      # the Windows host. We pick 18000 (not vLLM's default 8000) to avoid
+      # conflicts with other dev servers.
+      VLLM_BASE: ${VLLM_BASE:-http://host.docker.internal:18000}
+      VLLM_MODEL: ${VLLM_MODEL:-Qwen/Qwen3-14B-AWQ}
+      # Webhook URL to post completion summaries as "Jarvis" in #📋-jarvis-tasks.
+      DISCORD_JARVIS_TASKS_WEBHOOK_URL: ${DISCORD_JARVIS_TASKS_WEBHOOK_URL}
+      # Poll cadence (seconds) for fetching new delegated tasks.
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-5}
+      # Heartbeat cadence while a job is running.
+      HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-30}
+      # Tells git inside the container to use the mounted SSH key.
+      GIT_SSH_COMMAND: "ssh -i /root/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new"
+    volumes:
+      # The agent's home: workspaces, artifacts, logs, repos.yml all live here.
+      - C:/Jarvis:/workspace
+      # SSH key for git clone/push to github.com/codedvisiondesign/*.
+      - C:/Users/djohn/.ssh:/root/.ssh:ro
+      # User's global Claude config so Claude Code headless inherits MEMORY.md + skills.
+      # Mounted read-only; the container never writes to the user's claude dir.
+      - C:/Users/djohn/.claude:/root/.claude:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:17920/health', timeout=2).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
