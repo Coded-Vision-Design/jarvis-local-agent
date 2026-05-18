@@ -6,7 +6,7 @@ services:
     # there). Local builds inherit the registry name, so `docker compose push`
     # publishes when you want to bypass CI.
     build: .
-    image: ghcr.io/codedvisiondesign/jarvis-local-agent:latest
+    image: ghcr.io/coded-vision-design/jarvis-local-agent:latest
     container_name: jarvis-agent
     restart: unless-stopped
     ports:
@@ -18,7 +18,7 @@ services:
       JARVIS_LOCAL_AGENT_TOKEN: ${JARVIS_LOCAL_AGENT_TOKEN}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       VLLM_BASE: ${VLLM_BASE:-http://host.docker.internal:18000}
-      VLLM_MODEL: ${VLLM_MODEL:-Qwen/Qwen3-14B-AWQ}
+      VLLM_MODEL: ${VLLM_MODEL:-Qwen/Qwen2.5-Coder-14B-Instruct-AWQ}
       DISCORD_JARVIS_TASKS_WEBHOOK_URL: ${DISCORD_JARVIS_TASKS_WEBHOOK_URL}
       POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-5}
       HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-30}
@@ -102,7 +102,7 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-unused-local-vllm}
       OPENAI_BASE_URL: ${VLLM_BASE:-http://host.docker.internal:18000}/v1
-      OPENAI_MODEL: ${VLLM_MODEL:-Qwen/Qwen3-14B-AWQ}
+      OPENAI_MODEL: ${VLLM_MODEL:-Qwen/Qwen2.5-Coder-14B-Instruct-AWQ}
       # -F /dev/null bypasses ~/.ssh/config which Windows bind-mounts present
       # as world-readable — OpenSSH refuses to load it with "Bad owner or
       # permissions on /root/.ssh/config". UserKnownHostsFile=/dev/null for

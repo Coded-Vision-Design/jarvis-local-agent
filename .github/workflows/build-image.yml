@@ -28,7 +28,7 @@ on:
 # immutable — pin to one in compose if you need to roll back.
 env:
   REGISTRY: ghcr.io
-  OWNER: codedvisiondesign
+  OWNER: coded-vision-design
   AGENT_IMAGE: jarvis-local-agent
   CODE_SERVER_IMAGE: jarvis-code-server
 

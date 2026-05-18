@@ -22,7 +22,7 @@ The local sub-agent for delegated coding work. Runs on the Windows dev box, poll
 | jarvis-redis | 17924 | Redis 7 |
 | comfyui-proxy | 17926 | Wake-on-request ComfyUI (optional overlay) |
 | vLLM idle proxy | 18000 | Transparent proxy in front of vLLM (host process) |
-| vLLM real | 18001 | Qwen3-14B-AWQ (wakes on demand) |
+| vLLM real | 18001 | Qwen2.5-Coder-14B-Instruct-AWQ (wakes on demand) |
 | Hermes (optional) | 18002 | Second vLLM for creative/planning tasks |
 
 All bound to `127.0.0.1` only. Never expose any of these publicly.
@@ -62,7 +62,7 @@ Then follow [ROLLOUT.md](./ROLLOUT.md) for:
    - Simple → Qwen
 6. **Backend** runs the task in the repo workspace with stdin injection support.
 7. **Self-healing loop** runs smoke → unit → integration → regression (regression only on big-change tasks). On failure, retries the backend with the test output appended (up to 3 attempts).
-8. **Web project?** `npm run build` → rsync `dist/` to `<repo>.codedvisiondesign.co.uk` via the existing Claudia wildcard pipeline.
+8. **Web project?** `npm run build` → rsync `dist/` to `<repo>.coded-vision-design.co.uk` via the existing Claudia wildcard pipeline.
 9. **Git** commit, push, open PR via gh CLI.
 10. **Discord** notification with the PR URL and the live site URL.
 
@@ -88,14 +88,14 @@ A push to `main` that touches `Dockerfile`, `code-server.Dockerfile`,
 `scripts/`, `templates/`, or `hooks/` triggers `.github/workflows/build-image.yml`
 which builds both images and pushes to GHCR:
 
-- `ghcr.io/codedvisiondesign/jarvis-local-agent:latest` + `:sha-<short>`
-- `ghcr.io/codedvisiondesign/jarvis-code-server:latest` + `:sha-<short>`
+- `ghcr.io/coded-vision-design/jarvis-local-agent:latest` + `:sha-<short>`
+- `ghcr.io/coded-vision-design/jarvis-code-server:latest` + `:sha-<short>`
 
 **Adding a new worker host** (VPS, laptop, etc.):
 
 ```bash
 # 1. Log in to GHCR with a read:packages PAT (one time per host).
-echo $GHCR_PAT | docker login ghcr.io -u codedvisiondesign --password-stdin
+echo $GHCR_PAT | docker login ghcr.io -u coded-vision-design --password-stdin
 
 # 2. Compose pull + up. The :latest images come down.
 docker compose pull && docker compose up -d
