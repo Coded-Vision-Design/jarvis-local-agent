@@ -123,3 +123,61 @@ login state).
 subscription auth uses device-scoped refresh tokens. Sharing one across
 hosts risks anomaly-detection lockouts on the account. The 30 seconds
 of `claude login` per new host is the right trade.
+
+### Third worker on a spare machine (laptop, second desktop)
+
+Hive workers are stateless beyond their mounted OAuth volumes — adding a
+third is essentially the same recipe as the VPS one, just with different
+identity + capability tags.
+
+Pick an `AGENT_ID` that names the box (e.g. `laptop-djohn-mbp`,
+`desktop-2`). Decide capabilities: does this host have a GPU that can
+run Qwen? Has Claude Code been logged in? Is Docker available for
+deploys? Stamp those as a CSV.
+
+```bash
+# 1. Log in to GHCR (one-time per host).
+echo $GHCR_PAT | docker login ghcr.io -u coded-vision-design --password-stdin
+
+# 2. Minimal compose entry — adapt as needed. Save as
+#    ~/.jarvis-agent/docker-compose.yml on the new host.
+cat > ~/.jarvis-agent/docker-compose.yml <<'EOF'
+services:
+  jarvis-agent:
+    image: ghcr.io/coded-vision-design/jarvis-local-agent:latest
+    container_name: jarvis-agent
+    restart: unless-stopped
+    environment:
+      AGENT_ID: laptop-1                # rename per host
+      AGENT_CAPABILITIES: claude,codex  # no gpu/qwen/hermes/deploy
+      JARVIS_BASE: https://jarvis.codedvisiondesign.co.uk
+      JARVIS_LOCAL_AGENT_TOKEN: ${JARVIS_LOCAL_AGENT_TOKEN}
+      CLAUDE_FORCE_SUBSCRIPTION: "1"
+      VLLM_BASE: ""
+      HERMES_BASE: ""
+    volumes:
+      - ./workspace:/workspace
+      - ~/.ssh:/root/.ssh:ro
+      - jarvis-claude:/root/.claude
+      - jarvis-codex:/root/.codex
+volumes:
+  jarvis-claude:
+  jarvis-codex:
+EOF
+
+# 3. Bring it up + log in.
+docker compose -f ~/.jarvis-agent/docker-compose.yml up -d
+docker exec -it jarvis-agent claude login
+docker exec -it jarvis-agent codex login
+```
+
+The new worker starts polling immediately. The smart router (Phase 18c)
+reads `AGENT_CAPABILITIES` and routes only tasks this host can run —
+tasks tagged `["qwen"]` get re-queued for whichever sibling has the GPU.
+
+To make this worker visible in the `/workspace` toggle on Jarvis,
+append an entry to `WORKERS_CONFIG_JSON` in the cloud Jarvis `.env`
+(the sync-secrets workflow on the Jarvis repo renders this). For a
+laptop with no public hostname, leave `agentUrl`/`editorUrl`/
+`terminalUrl` pointing at `null` and you'll just see the worker name
+in tasks without a clickable pane.
