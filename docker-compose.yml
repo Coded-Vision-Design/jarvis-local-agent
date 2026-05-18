@@ -1,46 +1,195 @@
 services:
   jarvis-agent:
+    # `build:` keeps local iteration fast (edit src/, `docker compose build`,
+    # done — no CI roundtrip). `image:` is the GHCR tag so the same compose
+    # file works on the VPS via `docker compose pull` (no build context needed
+    # there). Local builds inherit the registry name, so `docker compose push`
+    # publishes when you want to bypass CI.
     build: .
-    image: jarvis-local-agent:latest
+    image: ghcr.io/codedvisiondesign/jarvis-local-agent:latest
     container_name: jarvis-agent
     restart: unless-stopped
-    # Dedicated out-of-range port to dodge conflicts with XAMPP (80/443/3306),
-    # common dev servers (3000s, 5000s, 8000s, 8080), Ollama (11434), Postgres
-    # (5432), Redis (6379). Bound to loopback only — never exposed on LAN.
     ports:
       - "127.0.0.1:17920:17920"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      # Reach the public Jarvis server for task polling + writeback.
       JARVIS_BASE: ${JARVIS_BASE:-https://jarvis.codedvisiondesign.co.uk}
       JARVIS_LOCAL_AGENT_TOKEN: ${JARVIS_LOCAL_AGENT_TOKEN}
-      # Anthropic key for Claude Code headless. Used only when backend=claude.
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-      # OpenAI-compatible endpoint for the local Qwen3-Coder served by vLLM on
-      # the Windows host. We pick 18000 (not vLLM's default 8000) to avoid
-      # conflicts with other dev servers.
       VLLM_BASE: ${VLLM_BASE:-http://host.docker.internal:18000}
       VLLM_MODEL: ${VLLM_MODEL:-Qwen/Qwen3-14B-AWQ}
-      # Webhook URL to post completion summaries as "Jarvis" in #📋-jarvis-tasks.
       DISCORD_JARVIS_TASKS_WEBHOOK_URL: ${DISCORD_JARVIS_TASKS_WEBHOOK_URL}
-      # Poll cadence (seconds) for fetching new delegated tasks.
       POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-5}
-      # Heartbeat cadence while a job is running.
       HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-30}
-      # Tells git inside the container to use the mounted SSH key.
-      GIT_SSH_COMMAND: "ssh -i /root/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new"
+      # -F /dev/null bypasses ~/.ssh/config which Windows bind-mounts present
+      # as world-readable — OpenSSH refuses to load it with "Bad owner or
+      # permissions on /root/.ssh/config". UserKnownHostsFile=/dev/null for
+      # the same reason. The private key itself is fine because OpenSSH only
+      # enforces strict perms on config files, not on keys passed via -i.
+      GIT_SSH_COMMAND: "ssh -F /dev/null -i /root/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null"
+      # GitHub token for private repo creation and gh CLI in the health loop
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # Proactive health loop (set HEALTH_LOOP_ENABLED=true to enable)
+      HEALTH_LOOP_ENABLED: ${HEALTH_LOOP_ENABLED:-false}
+      HEALTH_CHECK_INTERVAL_SECONDS: ${HEALTH_CHECK_INTERVAL_SECONDS:-600}
+      # VPS subdomain deploy (Claudia pipeline — *.codedvisiondesign.co.uk)
+      DEPLOY_ENABLED: ${DEPLOY_ENABLED:-true}
+      DEPLOY_HOST: ${DEPLOY_HOST:-root@168.231.78.207}
+      DEPLOY_BASE_PATH: ${DEPLOY_BASE_PATH:-/var/www/cdv-sites}
+      DEPLOY_DOMAIN: ${DEPLOY_DOMAIN:-codedvisiondesign.co.uk}
+      # Hermes second vLLM (creative/planning routing).
+      # Defaults to :18002 to avoid colliding with the real vLLM on :18001
+      # (which sits behind the idle proxy on :18000).
+      HERMES_BASE: ${HERMES_BASE:-http://host.docker.internal:18002}
+      HERMES_MODEL: ${HERMES_MODEL:-NousResearch/Hermes-3-Llama-3.1-8B}
+      # Tier 4 last-resort safety net (Cline Free proxy).
+      CLINE_API_KEY: ${CLINE_API_KEY:-}
+      CLINE_API_BASE: ${CLINE_API_BASE:-https://api.cline.bot/v1}
+      CLINE_MODEL: ${CLINE_MODEL:-}
+      # Codex CLI - shared OAuth/auth dir between agent and code-server.
+      # Logging in once from a code-server terminal authenticates Jarvis too.
+      CODEX_HOME: ${CODEX_HOME:-/workspace/.codex}
+      # Multi-host identity (hive mind). Override per worker in .env.
+      # Default keeps the container hostname when unset.
+      AGENT_ID: ${AGENT_ID:-}
+      AGENT_CAPABILITIES: ${AGENT_CAPABILITIES:-}
+      AGENT_MAX_CONCURRENT: ${AGENT_MAX_CONCURRENT:-1}
     volumes:
-      # The agent's home: workspaces, artifacts, logs, repos.yml all live here.
       - C:/Jarvis:/workspace
-      # SSH key for git clone/push to github.com/codedvisiondesign/*.
+      - C:/xampp/htdocs:/workspace/htdocs
       - C:/Users/djohn/.ssh:/root/.ssh:ro
-      # User's global Claude config so Claude Code headless inherits MEMORY.md + skills.
-      # Mounted read-only; the container never writes to the user's claude dir.
-      - C:/Users/djohn/.claude:/root/.claude:ro
+      # NOT :ro - Claude Code rotates the OAuth token in .credentials.json
+      # every ~1 hour. Read-only mount would freeze auth and force a
+      # silent fall-through to ANTHROPIC_API_KEY (which we strip in
+      # claude.py to keep the runner on subscription). RW lets the
+      # subscription auth stay live indefinitely.
+      - C:/Users/djohn/.claude:/root/.claude
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:17920/health', timeout=2).status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  jarvis-code-server:
+    # GHCR migration pending — once code-server.Dockerfile + its scripts are
+    # committed to git, swap this image tag to:
+    #   ghcr.io/codedvisiondesign/jarvis-code-server:latest
+    # and re-enable the second matrix entry in
+    # .github/workflows/build-image.yml.
+    build:
+      context: .
+      dockerfile: code-server.Dockerfile
+    image: jarvis-code-server:latest
+    container_name: jarvis-code-server
+    restart: unless-stopped
+    user: "0"
+    ports:
+      - "127.0.0.1:17921:8080"
+      # OAuth callback ports for VS Code extension auth flows (Codex, GitHub, etc.)
+      # Codex CLI binds its callback server to container:127.0.0.1:1455 which
+      # Docker can't reach via standard NAT. We publish host:1455 to a separate
+      # internal port (11455) where a socat proxy listens on 0.0.0.0 and
+      # forwards to 127.0.0.1:1455 inside the container. Codex sees a normal
+      # localhost callback; the browser sees the published host port.
+      - "127.0.0.1:1455:11455"
+      - "127.0.0.1:54321:54322"
+    command: --auth none --bind-addr 0.0.0.0:8080 /workspace/workspaces
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-unused-local-vllm}
+      OPENAI_BASE_URL: ${VLLM_BASE:-http://host.docker.internal:18000}/v1
+      OPENAI_MODEL: ${VLLM_MODEL:-Qwen/Qwen3-14B-AWQ}
+      # -F /dev/null bypasses ~/.ssh/config which Windows bind-mounts present
+      # as world-readable — OpenSSH refuses to load it with "Bad owner or
+      # permissions on /root/.ssh/config". UserKnownHostsFile=/dev/null for
+      # the same reason. The private key itself is fine because OpenSSH only
+      # enforces strict perms on config files, not on keys passed via -i.
+      GIT_SSH_COMMAND: "ssh -F /dev/null -i /root/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null"
+      EXTENSIONS_GALLERY: '{"serviceUrl":"https://marketplace.visualstudio.com/_apis/public/gallery","cacheUrl":"https://vscode.blob.core.windows.net/gallery/index","itemUrl":"https://marketplace.visualstudio.com/items"}'
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      # Same shared CODEX_HOME as the agent - one login auths both.
+      CODEX_HOME: ${CODEX_HOME:-/workspace/.codex}
+    volumes:
+      - C:/Jarvis:/workspace
+      - C:/xampp/htdocs:/workspace/htdocs
+      - C:/Users/djohn/.ssh:/root/.ssh:ro
+      # Both writable so Claude Code (CLI and VS Code extension) can rotate
+      # the OAuth token. Shares the same subscription as the host claude login.
+      - C:/Users/djohn/.claude:/root/.claude
+      - C:/Users/djohn/.claude.json:/root/.claude.json
+      - jarvis-code-server-data:/root/.local/share/code-server
+      # Writable .claude for the coder user so /login persists. Seeded once
+      # from the RO host mount at /root/.claude by code-server-init.sh.
+      - jarvis-coder-claude-data:/home/coder/.claude
+      # Bind-mount the init script so edits take effect on recreate without
+      # needing a full `docker compose build jarvis-code-server`.
+      - C:/Jarvis/agent/scripts/code-server-init.sh:/usr/local/bin/code-server-init.sh:ro
+      # Post-fixuid hook - runs at the very end of the base image's entrypoint
+      # to undo fixuid's chown of /home/coder back to root.
+      - C:/Jarvis/agent/scripts/10-fix-coder-perms.sh:/entrypoint.d/10-fix-coder-perms.sh:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Local dev stack ────────────────────────────────────────────────────────
+  # PHP 8.4 + Apache — serves /workspace/htdocs at http://127.0.0.1:17922
+  # AI can edit files in /workspace/htdocs and immediately see changes here.
+  jarvis-php:
+    image: php:8.4-apache
+    container_name: jarvis-php
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:17922:80"
+    volumes:
+      - C:/xampp/htdocs:/var/www/html
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # MariaDB 10.6 — compatible with existing XAMPP databases
+  jarvis-db:
+    image: mariadb:10.6
+    container_name: jarvis-db
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:17923:3306"
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-jarvis_root}
+      MARIADB_DATABASE: ${DB_NAME:-jarvis_dev}
+      MARIADB_USER: ${DB_USER:-jarvis}
+      MARIADB_PASSWORD: ${DB_PASSWORD:-jarvis_dev}
+    volumes:
+      - jarvis-db-data:/var/lib/mysql
+
+  # Redis — session cache, queue backend
+  jarvis-redis:
+    image: redis:7-alpine
+    container_name: jarvis-redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:17924:6379"
+
+  # Renovate — self-hosted Dependabot. Runs on demand via:
+  #   docker compose run --rm jarvis-renovate
+  # Or schedule via Task Scheduler / cron weekly.
+  jarvis-renovate:
+    image: renovate/renovate:latest
+    container_name: jarvis-renovate
+    restart: "no"
+    profiles: ["tools"]
+    environment:
+      RENOVATE_TOKEN: ${GITHUB_TOKEN}
+      RENOVATE_CONFIG_FILE: /usr/src/app/config.json
+      LOG_LEVEL: info
+    volumes:
+      - C:/Jarvis/renovate/config.json:/usr/src/app/config.json:ro
+
+volumes:
+  jarvis-code-server-data:
+  jarvis-coder-claude-data:
+  jarvis-db-data:

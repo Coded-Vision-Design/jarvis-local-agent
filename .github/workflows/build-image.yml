@@ -1,0 +1,102 @@
+# Build + push the two jarvis-local-agent images to GHCR so every hive
+# worker (desktop, VPS, future laptop) consumes the same bytes. Edit a
+# Dockerfile, push, both hosts pull on next deploy.
+#
+# Triggers narrowly on files that actually affect the image — no point
+# burning a build cycle on a README change.
+name: Build & push images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - code-server.Dockerfile
+      - requirements.txt
+      - src/**
+      - claude-config/**
+      - prompts/**
+      - jarvis_mcp/**
+      - scripts/**
+      - templates/**
+      - hooks/**
+      - .github/workflows/build-image.yml
+  workflow_dispatch: {}
+
+# Both images are pushed under the same repo namespace, lowercased per
+# GHCR convention. :latest moves with every main push; :sha-<short> is
+# immutable — pin to one in compose if you need to roll back.
+env:
+  REGISTRY: ghcr.io
+  OWNER: codedvisiondesign
+  AGENT_IMAGE: jarvis-local-agent
+  CODE_SERVER_IMAGE: jarvis-code-server
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # code-server is built in a follow-up — its Dockerfile + scripts
+        # need to land in git first. Re-add this matrix entry once those
+        # are committed:
+        #   - { name: code-server, dockerfile: code-server.Dockerfile,
+        #       image: jarvis-code-server }
+        include:
+          - name: agent
+            dockerfile: Dockerfile
+            image: jarvis-local-agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push ${{ matrix.image }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          # GHA cache cuts rebuild time from ~6 min to ~90 s when only
+          # claude-config or src/ changes (rare layers stay cached).
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ matrix.image }}:latest
+            ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ matrix.image }}:sha-${{ steps.sha.outputs.short }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/Coded-Vision-Design/jarvis-local-agent
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+
+  # Pull notification — fires after both images push. The desktop's
+  # `Pull latest images` slash command (or `docker compose pull && up -d`)
+  # is what actually rolls them out locally; the VPS worker (Phase 17a)
+  # pulls automatically via a deploy step appended here later.
+  notify:
+    needs: build
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+      - name: Note built tags
+        run: |
+          echo "Pushed:"
+          echo "  ghcr.io/${{ env.OWNER }}/${{ env.AGENT_IMAGE }}:latest"
+          echo "  ghcr.io/${{ env.OWNER }}/${{ env.AGENT_IMAGE }}:sha-${GITHUB_SHA::7}"
