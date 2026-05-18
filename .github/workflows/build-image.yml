@@ -42,15 +42,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # code-server is built in a follow-up — its Dockerfile + scripts
-        # need to land in git first. Re-add this matrix entry once those
-        # are committed:
-        #   - { name: code-server, dockerfile: code-server.Dockerfile,
-        #       image: jarvis-code-server }
         include:
           - name: agent
             dockerfile: Dockerfile
             image: jarvis-local-agent
+          - name: code-server
+            dockerfile: code-server.Dockerfile
+            image: jarvis-code-server
     steps:
       - uses: actions/checkout@v4
 
