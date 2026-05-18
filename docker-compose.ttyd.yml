@@ -1,0 +1,47 @@
+# Overlay compose for the ttyd sidecar — break-glass terminal access.
+# Bring up alongside the main stack with:
+#   docker compose -f docker-compose.yml -f docker-compose.ttyd.yml up -d
+#
+# Or just for ttyd:
+#   docker compose -f docker-compose.ttyd.yml up -d
+#
+# Exposes a browser-accessible tmux session over HTTP. Bound to loopback
+# on the workstation (you reach it at http://127.0.0.1:17925). On the
+# VPS it's published only inside the production-network bridge and
+# fronted by a Cloudflare tunnel with Cloudflare Access policy for auth.
+
+services:
+  jarvis-ttyd:
+    image: tsl0922/ttyd:latest
+    container_name: jarvis-ttyd
+    restart: unless-stopped
+    # ttyd wraps tmux. `new-session -A -s ops` attaches to the "ops"
+    # session if it exists, creates it otherwise — so you can disconnect
+    # and reattach, or open multiple browser tabs into the same session.
+    # tmux is the right primitive here vs raw bash: scroll-back, splits,
+    # detach on close.
+    command:
+      - "ttyd"
+      - "--writable"
+      - "--port=7820"
+      - "tmux"
+      - "new-session"
+      - "-A"
+      - "-s"
+      - "ops"
+    ports:
+      # Loopback on the workstation. On the VPS swap to "expose: 7820"
+      # and let traefik/cloudflare tunnel front it.
+      - "127.0.0.1:17925:7820"
+    volumes:
+      # Share the workspace so tmux sessions can `cd` into repos.
+      - C:/Jarvis:/workspace
+      # Read-only mount of host config so commands like `git`, `ssh`,
+      # `claude` find sensible defaults if invoked from the tmux session.
+      - C:/Users/djohn/.ssh:/root/.ssh:ro
+    working_dir: /workspace
+    # Install minimal tooling on entry — ttyd image is alpine-bare.
+    # Could move into a Dockerfile if it grows; keeping inline while
+    # the dep list is one-line.
+    environment:
+      TERM: xterm-256color
