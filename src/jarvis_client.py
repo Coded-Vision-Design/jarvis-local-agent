@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from .agent_identity import agent_id, identity_payload
 from .config import settings
 
 log = logging.getLogger("jarvis-agent.client")
@@ -18,7 +19,9 @@ class JarvisClient:
         self._headers = {
             "Authorization": f"Bearer {settings.jarvis_local_agent_token}",
             "Content-Type": "application/json",
-            "User-Agent": "jarvis-local-agent/0.1",
+            # User-Agent doubles as a cheap agent identifier in VPS access logs.
+            "User-Agent": f"jarvis-local-agent/0.2 (agent={agent_id()})",
+            "X-Jarvis-Agent-Id": agent_id(),
         }
         # One client, kept open. httpx pools connections.
         self._http = httpx.AsyncClient(
@@ -56,8 +59,11 @@ class JarvisClient:
             log.warning("append_run %s failed: %s %s", run_kind, r.status_code, r.text[:200])
 
     async def heartbeat(self, task_id: int) -> None:
+        # Attach agent identity so the VPS knows which worker is alive.
+        # Falls back gracefully if the VPS endpoint ignores the extra field.
+        body = {"kind": "heartbeat", "agent": identity_payload()}
         r = await self._http.post(
-            f"/api/tasks/{task_id}/local-agent", json={"kind": "heartbeat"}
+            f"/api/tasks/{task_id}/local-agent", json=body,
         )
         if r.status_code >= 400:
             log.warning("heartbeat failed: %s %s", r.status_code, r.text[:200])
@@ -69,6 +75,47 @@ class JarvisClient:
         )
         if r.status_code >= 400:
             log.warning("merge_metadata failed: %s %s", r.status_code, r.text[:200])
+
+    async def create_task(
+        self,
+        title: str,
+        body: str,
+        repo: str,
+        backend: str = "smart",
+        priority: int = 50,
+    ) -> dict[str, Any] | None:
+        """Create a new delegated task on the Jarvis server. Returns the created task or None."""
+        payload: dict[str, Any] = {
+            "title": title,
+            "body": body,
+            "status": "queued",
+            "metadata": {
+                "local_agent_backend": backend,
+                "local_agent_repo": repo,
+                "created_by": "jarvis-local-agent-mcp",
+            },
+            "priority": priority,
+        }
+        try:
+            r = await self._http.post("/api/tasks", json=payload)
+            if r.status_code in (200, 201):
+                return r.json().get("task") or r.json()
+            log.warning("create_task failed: %s %s", r.status_code, r.text[:200])
+            return None
+        except Exception as exc:
+            log.warning("create_task exception: %s", exc)
+            return None
+
+    async def get_recent_tasks(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Fetch recently completed/blocked tasks from the Jarvis server."""
+        try:
+            r = await self._http.get(f"/api/tasks?limit={limit}&status=done,blocked")
+            if r.status_code == 200:
+                data = r.json()
+                return data.get("tasks") or data if isinstance(data, list) else []
+            return []
+        except Exception:
+            return []
 
     async def set_status(
         self,

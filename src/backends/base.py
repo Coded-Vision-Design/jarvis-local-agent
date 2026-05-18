@@ -4,6 +4,7 @@ executes the task inside a checked-out workspace and returns a summary."""
 from __future__ import annotations
 
 import abc
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,8 +27,14 @@ class Backend(abc.ABC):
         task: str,
         workspace: Path,
         log_cb,  # async (kind: str, payload: dict) -> None
+        inject_queue: asyncio.Queue | None = None,
     ) -> BackendResult:
         """Execute `task` inside `workspace`. Stream progress via `log_cb`.
 
         `workspace` is the absolute path inside the container (under
-        /workspace/workspaces/<repo>) on the cloned + checked-out branch."""
+        /workspace/workspaces/<repo>) on the cloned + checked-out branch.
+
+        `inject_queue` is an optional asyncio.Queue whose items (strings) will
+        be written to the subprocess stdin as they arrive. Best-effort — CLIs
+        in fully autonomous mode (--yolo / --dangerously-skip-permissions) may
+        not read stdin at all."""
