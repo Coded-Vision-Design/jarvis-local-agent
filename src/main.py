@@ -127,6 +127,12 @@ class Health(BaseModel):
     qwen_ok: bool
     jarvis_reachable: bool
     repos_count: int
+    # Phase 18 quota heuristic — count of Claude subscription rate-limit
+    # hits in the last hour. Cloud TopBar surfaces it in the AgentDot
+    # tooltip so the user knows when delegated work is about to fall
+    # back to API or re-queue (depending on CLAUDE_FORCE_SUBSCRIPTION).
+    # 0 means clean. >5 is "subscription saturated this hour".
+    claude_rate_limits_last_hour: int = 0
 
 
 class ReposList(BaseModel):
@@ -156,6 +162,11 @@ async def health() -> Health:
     claude_ok = shutil.which("claude") is not None
     qwen_ok = shutil.which("qwen") is not None
 
+    # Avoid import at module top to keep startup time clean; quota_pressure
+    # only matters once /health is hit.
+    from .backends.claude import quota_pressure
+    qp = quota_pressure()
+
     return Health(
         ok=True,
         vllm_reachable=vllm_reachable,
@@ -163,6 +174,7 @@ async def health() -> Health:
         qwen_ok=qwen_ok,
         jarvis_reachable=jarvis_reachable,
         repos_count=len(load_repos()),
+        claude_rate_limits_last_hour=int(qp["count_last_hour"]),
     )
 
 

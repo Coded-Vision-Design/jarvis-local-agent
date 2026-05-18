@@ -41,6 +41,40 @@ async def _inject_watcher(
 # Markers that indicate Claude Code couldn't proceed because the auth path
 # is rate-limited. Subscription rate limits surface differently from API
 # rate limits; the CLI typically prints a clear English line either way.
+# Phase 18 quota heuristic — module-level counter so /health can show
+# "how often has Claude subscription been rate-limited recently?" The
+# real subscription quota isn't exposed by Anthropic, so a count of
+# recent rate-limits is the closest proxy. Reset implicitly because
+# entries past 1 hour are filtered out on read.
+_recent_rate_limits: list[float] = []
+
+
+def record_rate_limit() -> None:
+    """Called when a Claude subprocess returns rate-limited output."""
+    import time as _t
+    _recent_rate_limits.append(_t.time())
+
+
+def quota_pressure() -> dict[str, object]:
+    """Return a snapshot of recent rate-limit events for /health.
+
+    Shape: { count_last_hour, last_at }. The cloud TopBar reads this and
+    flips the agent dot's tooltip to "claude pressure: 3 hits/hr" so
+    the user knows when delegated work is about to start hitting paid
+    API fallback (or, with CLAUDE_FORCE_SUBSCRIPTION=1 on the VPS,
+    re-queueing instead of running).
+    """
+    import time as _t
+    cutoff = _t.time() - 3600
+    recent = [t for t in _recent_rate_limits if t >= cutoff]
+    # Trim in place so memory stays bounded.
+    _recent_rate_limits[:] = recent
+    return {
+        "count_last_hour": len(recent),
+        "last_at": recent[-1] if recent else None,
+    }
+
+
 _RATE_LIMIT_MARKERS = (
     "rate limit",          # generic — covers most cases
     "rate_limit_error",    # SDK-shaped JSON
@@ -127,6 +161,8 @@ class ClaudeBackend(Backend):
             stderr_text = (await proc.stderr.read()).decode("utf-8", errors="replace")
 
         rate_limited = rc != 0 and _looks_rate_limited(captured, stderr_text)
+        if rate_limited:
+            record_rate_limit()
         return rc, captured, stderr_text, spent_tokens_total, rate_limited
 
     async def run(
