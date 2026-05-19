@@ -22,6 +22,16 @@ class Settings(BaseSettings):
     poll_interval_seconds: int = 5
     heartbeat_interval_seconds: int = 30
 
+    # Phase 22 — WebSocket gateway for cloud->agent task push.
+    # When set, the agent opens a persistent WS to this URL and
+    # triggers an immediate claim on every {type:"new_task"} push,
+    # cutting task pickup from ~5 s to ~50 ms. The poll_loop stays
+    # alive as a reconnect/cold-start fallback (cadence raised to
+    # ws_fallback_poll_seconds once the WS is connected).
+    jarvis_ws_url: str = "wss://jarvis-ws.codedvisiondesign.co.uk/agent"
+    jarvis_ws_enabled: bool = True
+    ws_fallback_poll_seconds: int = 30
+
     workspace_root: Path = Path("/workspace")
     repos_yml_path: Path = Path("/workspace/agent/repos.yml")
 

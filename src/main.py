@@ -33,6 +33,7 @@ from .jarvis_client import get_client
 from .poller import poll_loop
 from .repos import is_whitelisted, load_repos
 from .state import bus, inject_queues
+from .ws_subscriber import ws_subscribe_loop
 
 logging.basicConfig(
     level=settings.log_level.upper(),
@@ -48,20 +49,29 @@ async def lifespan(app: FastAPI):
     stop = asyncio.Event()
     poll_task = asyncio.create_task(poll_loop(stop))
     health_task = asyncio.create_task(health_loop(stop))
-    log.info("startup complete; polling jarvis at %s", settings.jarvis_base)
+    # Phase 22 — WebSocket subscriber for sub-50 ms task-push pickup.
+    # Runs alongside the existing poll loop (which acts as the
+    # reconnect/cold-start fallback).
+    ws_task = asyncio.create_task(ws_subscribe_loop(stop))
+    log.info(
+        "startup complete; polling jarvis at %s; ws=%s",
+        settings.jarvis_base,
+        settings.jarvis_ws_url if settings.jarvis_ws_enabled else "disabled",
+    )
     try:
         yield
     finally:
-        log.info("shutdown: signalling poll and health loops")
+        log.info("shutdown: signalling poll, health and ws loops")
         stop.set()
         try:
             await asyncio.wait_for(
-                asyncio.gather(poll_task, health_task, return_exceptions=True),
+                asyncio.gather(poll_task, health_task, ws_task, return_exceptions=True),
                 timeout=5.0,
             )
         except asyncio.TimeoutError:
             poll_task.cancel()
             health_task.cancel()
+            ws_task.cancel()
         await get_client().aclose()
 
 
