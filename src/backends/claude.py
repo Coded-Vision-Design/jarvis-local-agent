@@ -84,6 +84,26 @@ _RATE_LIMIT_MARKERS = (
     "you have reached",    # plan-quota wording
 )
 
+# Phase 21g — model-tier cascade within Claude. Each tier is tried in
+# order on rate-limit before falling out to the broader smart-router
+# (which will then try codex, etc.). Opus is the default ceiling;
+# Sonnet picks up most of the slack; Haiku covers the long tail when
+# both higher tiers are exhausted. Override via env if you want to
+# pin a single tier (e.g. CLAUDE_MODEL_TIERS=claude-haiku-4-5-20251001).
+_DEFAULT_MODEL_TIERS = (
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+)
+
+
+def _model_tiers() -> tuple[str, ...]:
+    raw = os.environ.get("CLAUDE_MODEL_TIERS", "").strip()
+    if not raw:
+        return _DEFAULT_MODEL_TIERS
+    tiers = tuple(s.strip() for s in raw.split(",") if s.strip())
+    return tiers or _DEFAULT_MODEL_TIERS
+
 
 def _looks_rate_limited(stdout_lines: list[str], stderr_text: str) -> bool:
     """Heuristic: did the last attempt fail because of a rate / usage limit?"""
@@ -181,7 +201,7 @@ class ClaudeBackend(Backend):
         # --output-format=stream-json gives us structured progress to push into task_runs.
         # --dangerously-skip-permissions is the headless equivalent of --yolo; we accept
         #   the risk because the workspace is sandboxed to /workspace/workspaces/<repo>.
-        cmd = [
+        base_cmd = [
             "claude",
             "-p", task,
             "--output-format", "stream-json",
@@ -209,7 +229,7 @@ class ClaudeBackend(Backend):
                 "kind": "config_conflict",
             })
             force_api = False
-        attempts = (
+        auth_attempts: list[bool] = (
             [True]   # API key only — explicit opt-in path
             if force_api else
             [False]  # subscription only — VPS worker mode
@@ -217,49 +237,95 @@ class ClaudeBackend(Backend):
             [False, True]   # subscription, fall back to API on rate-limit
         )
 
+        # Phase 21g — outer loop over model tiers. Order: try the top
+        # tier (Opus) on every auth path first; only descend to Sonnet
+        # / Haiku when every auth attempt for the current tier has been
+        # exhausted by rate-limits. This preserves the model quality
+        # when possible (API quota for Opus exists when subscription
+        # doesn't) and falls to a cheaper tier only when the upper one
+        # is genuinely unavailable. Caller's smart-router takes over
+        # with codex / other backends once we exit fully exhausted.
+        model_tiers = _model_tiers()
+
         rc = 0
         captured: list[str] = []
         spent_tokens_total = 0
         spent_pence_total = 0
         stderr_text = ""
+        any_succeeded = False
 
-        for attempt_idx, use_api_key in enumerate(attempts):
-            env = {
-                **os.environ,
-                "PATH": "/usr/local/bin:/usr/bin:/bin",
-                "HOME": "/root",
-                "CLAUDE_CONFIG_DIR": "/root/.claude",
-            }
-            if not use_api_key:
-                env.pop("ANTHROPIC_API_KEY", None)
+        for tier_idx, model_id in enumerate(model_tiers):
+            cmd = [*base_cmd, "--model", model_id]
+            tier_label = model_id.split("-claude-")[-1] if "claude-" in model_id else model_id
+            tier_exhausted = False
 
-            await log_cb("assistant_text", {
-                "text": "claude-code starting" + (
-                    " (subscription)" if not use_api_key else " (api key — fallback)"
-                ),
-            })
+            for attempt_idx, use_api_key in enumerate(auth_attempts):
+                env = {
+                    **os.environ,
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "HOME": "/root",
+                    "CLAUDE_CONFIG_DIR": "/root/.claude",
+                }
+                if not use_api_key:
+                    env.pop("ANTHROPIC_API_KEY", None)
 
-            (
-                rc,
-                captured,
-                stderr_text,
-                spent_tokens_total,
-                rate_limited,
-            ) = await self._run_one(cmd, env, workspace, log_cb, inject_queue)
+                await log_cb("assistant_text", {
+                    "text": (
+                        f"claude-code starting · {model_id}"
+                        + (" (subscription)" if not use_api_key else " (api key — fallback)")
+                    ),
+                })
 
-            if not rate_limited:
+                (
+                    rc,
+                    captured,
+                    stderr_text,
+                    spent_tokens_total,
+                    rate_limited,
+                ) = await self._run_one(cmd, env, workspace, log_cb, inject_queue)
+
+                if not rate_limited and rc == 0:
+                    any_succeeded = True
+                    break
+
+                # Non-rate-limit failure on this auth attempt — break the
+                # auth loop and (for non-zero exits without a rate-limit
+                # signal) also break the tier loop, because retrying a
+                # cheaper model is unlikely to fix a code-level error.
+                if not rate_limited:
+                    tier_exhausted = True
+                    break
+
+                # Rate-limited on this auth attempt; if there's another
+                # auth path left for this tier, try it before descending.
+                if attempt_idx + 1 < len(auth_attempts):
+                    await log_cb("jarvis_note", {
+                        "message": (
+                            f"{model_id} subscription hit rate limit. Falling back to "
+                            "ANTHROPIC_API_KEY for this attempt; subscription will be "
+                            "tried again on the next task."
+                        ),
+                        "kind": "fallback_to_api",
+                    })
+                    continue
+
+                # Last auth attempt for this tier also rate-limited.
+                tier_exhausted = True
+
+            if any_succeeded:
                 break
 
-            # Rate-limited on subscription. If we have another attempt queued
-            # (the API key one), retry; otherwise surface the rate limit.
-            if attempt_idx + 1 < len(attempts):
+            # Descend to the next model tier if we have one left.
+            if tier_exhausted and tier_idx + 1 < len(model_tiers):
+                next_tier = model_tiers[tier_idx + 1]
                 await log_cb("jarvis_note", {
                     "message": (
-                        "Claude subscription hit rate limit. Falling back to "
-                        "ANTHROPIC_API_KEY for this run only — subscription will "
-                        "be tried again on the next task."
+                        f"{model_id} exhausted (rate-limited or errored on every auth path). "
+                        f"Descending to {next_tier}."
                     ),
-                    "kind": "fallback_to_api",
+                    "kind": "model_fallback",
+                    "from_model": model_id,
+                    "to_model": next_tier,
                 })
 
         full_log = "\n".join(captured[-30:])
