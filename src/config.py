@@ -32,6 +32,15 @@ class Settings(BaseSettings):
     jarvis_ws_enabled: bool = True
     ws_fallback_poll_seconds: int = 30
 
+    # Phase 22 — code-server URL surfaced by the agent's /ui HTML
+    # ("Open VS Code" button). Default points at the local docker-
+    # compose code-server (loopback). VPS agents set this to their
+    # public Cloudflare tunnel URL (e.g.
+    # https://vps-code.codedvisiondesign.co.uk) so clicking the
+    # button from the workspace pane lands on the VPS editor
+    # instead of the user's localhost.
+    code_server_url: str = "http://127.0.0.1:17921"
+
     workspace_root: Path = Path("/workspace")
     repos_yml_path: Path = Path("/workspace/agent/repos.yml")
 

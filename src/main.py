@@ -501,7 +501,7 @@ _UI_HTML = """<!DOCTYPE html>
 <div id="sidebar">
   <h1>Jarvis Agent</h1>
   <div id="status" class="disconnected">⬤ disconnected</div>
-  <a id="vscode-link" href="http://127.0.0.1:17921" target="_blank">→ Open VS Code</a>
+  <a id="vscode-link" href="__CODE_SERVER_URL__" target="_blank">→ Open VS Code</a>
   <div id="tasks-container">
     <div id="no-tasks">No active tasks</div>
   </div>
@@ -741,8 +741,14 @@ async def inject_message(task_id: int, body: InjectRequest) -> dict:
 
 @app.get("/ui", response_class=HTMLResponse, include_in_schema=False)
 async def serve_ui() -> HTMLResponse:
-    """Self-contained dark terminal UI for watching task progress in real-time."""
-    return HTMLResponse(_UI_HTML)
+    """Self-contained dark terminal UI for watching task progress in real-time.
+
+    Phase 22 - the "Open VS Code" link target comes from
+    settings.code_server_url so VPS agents point at the public
+    Cloudflare tunnel rather than the user's local loopback. Default
+    keeps the workstation behaviour unchanged."""
+    html = _UI_HTML.replace("__CODE_SERVER_URL__", settings.code_server_url)
+    return HTMLResponse(html)
 
 
 # ── Task management endpoints (used by MCP server + Cline) ────────────────────
