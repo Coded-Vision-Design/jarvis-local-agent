@@ -1,0 +1,3 @@
+# Code owners for this repo. Seeded by scripts/org-rollout.ps1.
+# Pattern: every file requires review from the org owner.
+* @CodedVisionDesign
