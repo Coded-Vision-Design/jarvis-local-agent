@@ -16,13 +16,23 @@ log = logging.getLogger("jarvis-agent.client")
 class JarvisClient:
     def __init__(self) -> None:
         self.base = settings.jarvis_base.rstrip("/")
-        self._headers = {
+        # Phase 21m — advertise the roles this worker will accept.
+        # Comma-separated env var AGENT_ROLES. When unset / empty,
+        # the server treats it as "accepts all roles" (back-compat).
+        # decompose_and_delegate-generated children carry
+        # metadata.role; the poll claim filters by this header.
+        import os as _os
+        roles_env = (_os.environ.get("AGENT_ROLES") or "").strip()
+        headers = {
             "Authorization": f"Bearer {settings.jarvis_local_agent_token}",
             "Content-Type": "application/json",
             # User-Agent doubles as a cheap agent identifier in VPS access logs.
             "User-Agent": f"jarvis-local-agent/0.2 (agent={agent_id()})",
             "X-Jarvis-Agent-Id": agent_id(),
         }
+        if roles_env:
+            headers["X-Jarvis-Agent-Roles"] = roles_env
+        self._headers = headers
         # One client, kept open. httpx pools connections.
         self._http = httpx.AsyncClient(
             base_url=self.base,
