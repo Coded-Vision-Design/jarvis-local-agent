@@ -24,6 +24,8 @@ from .backends import get_backend
 from .config import settings
 from .discord_webhook import post_as_jarvis
 from .jarvis_client import get_client
+from .notes import emit_handover_note
+from .preflight import fetch_prior_context
 from .repos import is_whitelisted
 from .state import bus, inject_queues, slots
 
@@ -595,6 +597,21 @@ async def run_job(task: dict[str, Any]) -> None:
             # 2. Run backend
             backend = get_backend(backend_name)
 
+            # Phase 19: pre-work retrieval. Pull prior handover notes
+            # for this entity + pattern matches across the corpus and
+            # prepend them so Jarvis sees lessons from prior work
+            # before its first move. Best-effort — if the calls fail
+            # the runner keeps going with an empty block.
+            prior_context_block = ""
+            try:
+                prior_context_block = await fetch_prior_context(client, task)
+                if prior_context_block:
+                    await client.append_run(task_id, "jarvis_note", {
+                        "message": f"prepended prior context ({len(prior_context_block)} chars from task_notes)",
+                    })
+            except Exception as _exc:
+                log.warning("prior context fetch failed: %s", _exc)
+
             # Prepend coding standards to every task so agents use correct versions
             standards_path = settings.workspace_root / "agent" / "prompts" / "CODING_STANDARDS.md"
             task_with_standards = body
@@ -604,10 +621,70 @@ async def run_job(task: dict[str, Any]) -> None:
                     f"<coding_standards>\n{standards}\n</coding_standards>\n\n"
                     f"<task>\n{body}\n</task>"
                 )
+            if prior_context_block:
+                task_with_standards = (
+                    f"<prior_context>\n{prior_context_block}\n</prior_context>\n\n"
+                    f"{task_with_standards}"
+                )
+
+            # Phase 19 — track tool calls + errors for the auto-note
+            # context. Capped to recent N so the note prompt stays small.
+            recent_tools: list[str] = []
+            recent_errors: list[str] = []
+            tool_error_counts: dict[str, int] = {}
 
             async def log_cb(kind: str, payload: dict) -> None:
                 await client.append_run(task_id, kind, payload)
                 await bus.put_event(task_id, kind, payload)
+                # Phase 19 — track for the note context + fire the
+                # tool_error trigger on the 2nd consecutive failure
+                # of the same tool (one-off transients don't qualify).
+                if kind == "tool_call":
+                    tname = payload.get("name") or ""
+                    recent_tools.append(tname)
+                    if len(recent_tools) > 12:
+                        del recent_tools[: len(recent_tools) - 12]
+                elif kind == "tool_result":
+                    # Reset the counter on success — only consecutive
+                    # failures of the SAME tool trigger a note.
+                    tname = payload.get("name") or ""
+                    if tname and tool_error_counts.get(tname):
+                        tool_error_counts[tname] = 0
+                elif kind == "error":
+                    msg = payload.get("message") or payload.get("error") or ""
+                    if msg:
+                        recent_errors.append(str(msg)[:300])
+                        if len(recent_errors) > 6:
+                            del recent_errors[: len(recent_errors) - 6]
+                    # Did this error come from a recently-attempted tool?
+                    tname = (recent_tools or [""])[-1]
+                    if tname:
+                        tool_error_counts[tname] = tool_error_counts.get(tname, 0) + 1
+                        if tool_error_counts[tname] == 2:
+                            # Fire-and-forget the note so the runner
+                            # never blocks on note generation.
+                            asyncio.create_task(emit_handover_note(
+                                client, task, "tool_error", backend_name,
+                                context={
+                                    "recent_tools": list(recent_tools),
+                                    "recent_errors": list(recent_errors),
+                                },
+                                artefacts={"tool": tname, "consecutive_failures": 2},
+                            ))
+
+            async def write_handover(
+                trigger: str, artefacts: dict[str, Any] | None = None,
+            ) -> None:
+                """Inline shortcut so each trigger site stays one-line."""
+                await emit_handover_note(
+                    client, task, trigger, backend_name,
+                    context={
+                        "recent_tools": list(recent_tools),
+                        "recent_errors": list(recent_errors),
+                        "user_steer": metadata.get("last_user_steer", ""),
+                    },
+                    artefacts=artefacts or {},
+                )
 
             result = await backend.run(task_with_standards, workspace, log_cb,
                                        inject_queue=inject_queues.get(task_id))
@@ -669,6 +746,13 @@ async def run_job(task: dict[str, Any]) -> None:
                     "summary": result.summary,
                     "error": result.error or "",
                 })
+                # Phase 19 trigger — write a structured blocked-note
+                # before flipping status so the next engineer (or the
+                # next Jarvis run) picks up knowing what stalled.
+                await write_handover("blocked", artefacts={
+                    "summary": result.summary[:400],
+                    "error": (result.error or "")[:400],
+                })
                 await client.set_status(task_id, "blocked")
                 await post_as_jarvis(
                     f"⚠️ Task #{task_id} ({backend_name}, {repo}) failed: {result.summary[:300]}"
@@ -680,12 +764,20 @@ async def run_job(task: dict[str, Any]) -> None:
                 await client.append_run(task_id, "jarvis_note", {
                     "message": "sub-agent finished with no file changes",
                 })
+                elapsed = int(time.time() - started)
+                # Phase 19 — done-note even on the no-changes path so
+                # the engineer log captures "ran, decided nothing to
+                # do, reasoned why".
+                await write_handover("done", artefacts={
+                    "time_spent_seconds": elapsed,
+                    "no_changes": True,
+                    "spent_pence": result.spent_pence,
+                })
                 await client.set_status(
                     task_id, "done",
                     spent_pence=result.spent_pence,
                     spent_tokens=result.spent_tokens,
                 )
-                elapsed = int(time.time() - started)
                 await post_as_jarvis(
                     f"ℹ️ Task #{task_id} ({backend_name}, `{repo}`) done — no changes needed. _{elapsed}s_"
                 )
@@ -764,13 +856,24 @@ async def run_job(task: dict[str, Any]) -> None:
                         "message": "no build output found - skipping deploy",
                     })
 
+            elapsed = int(time.time() - started)
+            # Phase 19 done-note (success path) — captures the
+            # artefacts (PR URL, branch, deploy URL, time spent) and
+            # asks the backend for a structured engineer summary.
+            await write_handover("done", artefacts={
+                "pr_url": pr_url,
+                "branch": branch,
+                "deploy_url": deploy_url,
+                "time_spent_seconds": elapsed,
+                "spent_pence": result.spent_pence,
+            })
+
             await client.set_status(
                 task_id, "done",
                 spent_pence=result.spent_pence,
                 spent_tokens=result.spent_tokens,
             )
 
-            elapsed = int(time.time() - started)
             mins, secs = divmod(elapsed, 60)
             elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
             msg = (
@@ -789,6 +892,15 @@ async def run_job(task: dict[str, Any]) -> None:
             "message": "runner exception",
             "exception": str(e),
         })
+        # Phase 19 blocked-note (exception path). Best-effort; if note
+        # generation itself fails too we still flip status + alert.
+        try:
+            await write_handover("blocked", artefacts={
+                "exception": str(e)[:400],
+                "exception_type": type(e).__name__,
+            })
+        except Exception:
+            log.exception("blocked-note emit failed during exception handler")
         await client.set_status(task_id, "blocked")
         await post_as_jarvis(
             f"💥 Task #{task_id} crashed in the local agent: `{type(e).__name__}: {str(e)[:200]}`"

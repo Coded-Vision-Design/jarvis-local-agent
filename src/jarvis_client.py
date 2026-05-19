@@ -76,6 +76,82 @@ class JarvisClient:
         if r.status_code >= 400:
             log.warning("merge_metadata failed: %s %s", r.status_code, r.text[:200])
 
+    # ── Phase 19 handover notes ────────────────────────────────────────
+    async def post_note(self, task_id: int, body: dict[str, Any]) -> dict[str, Any] | None:
+        """Append a handover note. Server stamps author_kind, agent_id,
+        backend from bearer + body context. Returns the created note or
+        None on failure (we never raise; note writes are best-effort).
+
+        Fire-and-forget kicks the embed pipeline so the note becomes
+        RAG-searchable within a few seconds — we don't await it because
+        the runner shouldn't block on RAG ops."""
+        import asyncio as _asyncio
+        body.setdefault("agent_id", agent_id())
+        r = await self._http.post(f"/api/tasks/{task_id}/notes", json=body)
+        if r.status_code >= 400:
+            log.warning("post_note failed: %s %s", r.status_code, r.text[:200])
+            return None
+        try:
+            note = r.json().get("note")
+        except Exception:
+            return None
+        if note and isinstance(note.get("id"), int):
+            _asyncio.create_task(self._embed_note_async(note["id"]))
+        return note
+
+    async def _embed_note_async(self, note_id: int) -> None:
+        """Background embed kick. Idempotent on the server side so a
+        retry is safe. Failures logged, never raised."""
+        try:
+            r = await self._http.post("/api/rag/embed-note", json={"note_id": note_id})
+            if r.status_code >= 400:
+                log.warning("embed-note %s failed: %s %s", note_id, r.status_code, r.text[:200])
+        except Exception as exc:
+            log.warning("embed-note %s exception: %s", note_id, exc)
+
+    async def recent_notes_for_entity(self, entity: str, limit: int = 10) -> list[dict[str, Any]]:
+        """First tier of pre-work retrieval — last N non-superseded
+        notes on the given entity, newest first."""
+        if not entity:
+            return []
+        r = await self._http.get(
+            "/api/tasks/notes/recent",
+            params={"entity": entity, "limit": limit},
+        )
+        if r.status_code >= 400:
+            log.warning("recent_notes failed: %s %s", r.status_code, r.text[:200])
+            return []
+        try:
+            return r.json().get("notes", [])
+        except Exception:
+            return []
+
+    async def search_notes(
+        self,
+        q: str = "",
+        tags: list[str] | None = None,
+        triggers: list[str] | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Second tier of pre-work retrieval — FTS + tag-AND across all
+        notes regardless of entity. Surfaces cross-tenant failure
+        patterns ("I've seen this kind of bleed in 3 other repos")."""
+        params: dict[str, Any] = {"limit": limit}
+        if q:
+            params["q"] = q
+        if tags:
+            params["tags"] = ",".join(tags)
+        if triggers:
+            params["triggers"] = ",".join(triggers)
+        r = await self._http.get("/api/tasks/notes/search", params=params)
+        if r.status_code >= 400:
+            log.warning("search_notes failed: %s %s", r.status_code, r.text[:200])
+            return []
+        try:
+            return r.json().get("notes", [])
+        except Exception:
+            return []
+
     async def create_task(
         self,
         title: str,
