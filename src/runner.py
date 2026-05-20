@@ -137,7 +137,7 @@ def _interpret_error(exc: Exception) -> tuple[str, str] | None:
             "git fetch exit 128 — stale remote auth, moved origin URL, "
             "or corrupted workspace .git. The runner now self-heals this "
             "by re-cloning fresh on the next attempt.",
-            "Re-trigger Task #7. If it still fails, verify "
+            "Re-trigger the task. If it still fails, verify "
             "JARVIS_AGENT_REPO_WRITE_TOKEN is set in /workspace/agent/.env "
             "and matches a fine-grained PAT with Contents: write on the "
             "Coded-Vision-Design org. Worst case, "
