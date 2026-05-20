@@ -132,6 +132,18 @@ def _interpret_error(exc: Exception) -> tuple[str, str] | None:
             "`docker exec jarvis-agent curl -I https://api.github.com`. "
             "If it can't, the host's DNS or docker network may be misconfigured.",
         )
+    if "push" in haystack and "non-zero exit status 128" in haystack:
+        return (
+            "git push exit 128 — typically the origin URL is missing "
+            "credentials (gh repo create --clone leaves it as plain HTTPS), "
+            "or the workspace cannot reach github.com. The runner now "
+            "rewrites origin to the HTTPS-with-PAT form right after "
+            "gh repo create, so this should self-heal on the next run.",
+            "Re-trigger the task. If it still fails, run "
+            "`docker exec jarvis-agent git -C /workspace/workspaces/<repo> "
+            "remote -v` and confirm origin looks like "
+            "`https://x-access-token:<token>@github.com/...`.",
+        )
     if "fetch" in haystack and "non-zero exit status 128" in haystack:
         return (
             "git fetch exit 128 — stale remote auth, moved origin URL, "
@@ -221,6 +233,16 @@ def _create_private_repo(repo: str, target: Path) -> Path:
         "--clone",
         "--description", "Created by Jarvis local agent",
     ], cwd=str(target.parent))
+
+    # `gh repo create --clone` sets origin to a credential-less HTTPS
+    # URL; the subsequent `git push` then dies with exit 128 because
+    # the credential helper inside the container isn't wired up. Flip
+    # origin to the same HTTPS-with-PAT form used by the regular
+    # clone/fetch path so push works without leaning on gh's keychain.
+    try:
+        _sh(["git", "remote", "set-url", "origin", _origin_url(repo)], cwd=target)
+    except subprocess.CalledProcessError:
+        log.warning("could not rewrite origin URL after gh repo create — push may fail")
 
     # Set git identity for all commits in this repo
     _sh(["git", "config", "user.email", "contact@codedvisiondesign.co.uk"], cwd=target)
