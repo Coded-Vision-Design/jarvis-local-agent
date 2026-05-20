@@ -535,7 +535,33 @@ async def run_job(task: dict[str, Any]) -> None:
         await client.set_status(task_id, "queued")
         return
 
-    if not repo or not is_whitelisted(str(repo)):
+    # Phase G1 — bypass the whitelist when the task explicitly opts into
+    # scaffold mode (metadata.local_agent_create_repo=True). In that
+    # case _git_clone_or_fetch → _create_private_repo runs `gh repo
+    # create` AND appends the repo to repos.yml via add_to_whitelist
+    # before the backend ever sees it, so the whitelist check is
+    # redundant (and would block the very flow it should enable).
+    #
+    # Heuristic fallback: if the task body explicitly asks to create the
+    # repo ("create the repo", "scaffold a new", "if the repo doesn't
+    # exist yet, create it") we infer the scaffold intent. False positives
+    # only matter if the repo name collides with something real on the
+    # CVD org — gh repo create errors out cleanly in that case.
+    scaffold_requested = bool(metadata.get("local_agent_create_repo"))
+    if not scaffold_requested and isinstance(body, str):
+        body_lower = body.lower()
+        scaffold_hints = (
+            "if the repo doesn't exist yet, create it",
+            "if the repo doesn't exist, create it",
+            "create the repo if it doesn't exist",
+            "scaffold a new",
+            "scaffold the repo",
+        )
+        if any(h in body_lower for h in scaffold_hints):
+            scaffold_requested = True
+            metadata["local_agent_create_repo"] = True
+
+    if not repo or (not is_whitelisted(str(repo)) and not scaffold_requested):
         await client.append_run(
             task_id,
             "error",
@@ -544,6 +570,7 @@ async def run_job(task: dict[str, Any]) -> None:
         await client.set_status(task_id, "blocked")
         await post_as_jarvis(
             f"❌ Task #{task_id} blocked: repo `{repo}` isn't whitelisted in `C:\\Jarvis\\agent\\repos.yml`."
+            f" If this should auto-scaffold, set `metadata.local_agent_create_repo=true` on the task."
         )
         return
 
