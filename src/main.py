@@ -423,10 +423,13 @@ async def describe_image_endpoint(body: DescribeImageRequest) -> dict:
         raise HTTPException(400, "provide either image_path or image_base64")
 
     if body.image_path:
-        from pathlib import Path
-        p = Path(body.image_path)
+        from .safe_path import safe_local_path
+        try:
+            p = safe_local_path(body.image_path)
+        except ValueError:
+            raise HTTPException(400, "invalid image_path")
         if not p.exists():
-            raise HTTPException(404, f"image not found: {body.image_path}")
+            raise HTTPException(404, "image not found")
         result = await describe_image(p, body.prompt, max_tokens=body.max_tokens)
     else:
         data_url = f"data:image/png;base64,{body.image_base64}"

@@ -29,6 +29,8 @@ from typing import Any
 
 import httpx
 
+from ..safe_path import safe_local_path
+
 log = logging.getLogger("jarvis-agent.backend.vision")
 
 VISION_BASE = os.environ.get("VISION_BASE", "http://host.docker.internal:18003")
@@ -38,7 +40,7 @@ VISION_TIMEOUT = float(os.environ.get("VISION_TIMEOUT_S", "60"))
 
 def _image_to_data_url(path: str | Path) -> str:
     """Encode a local image file as a data URL the OpenAI-compat API accepts."""
-    p = Path(path)
+    p = safe_local_path(path)
     ext = p.suffix.lower().lstrip(".") or "png"
     mime = {"jpg": "jpeg"}.get(ext, ext)
     data = p.read_bytes()

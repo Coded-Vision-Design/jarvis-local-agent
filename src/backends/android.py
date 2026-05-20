@@ -32,6 +32,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from ..safe_path import safe_local_path
+
 log = logging.getLogger("jarvis-agent.backend.android")
 
 ADB_SERVER_SOCKET = os.environ.get("ADB_SERVER_SOCKET", "tcp:host.docker.internal:5037")
@@ -67,8 +69,9 @@ def host_status() -> dict[str, Any]:
         }
     try:
         return json.loads(HOST_STATUS_FILE.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return {"state": "error", "detail": f"could not read status: {exc}"}
+    except Exception:
+        log.warning("could not read android host status file", exc_info=True)
+        return {"state": "error", "detail": "could not read status file"}
 
 
 async def _run(cmd: list[str], cwd: Path | None = None, timeout: int = 600) -> tuple[int, str, str]:
@@ -174,12 +177,16 @@ async def run_unit_tests(workspace: Path, variant: str = "Debug") -> dict[str, A
 
 async def install_apk(apk_path: str, device_id: str | None = None) -> dict[str, Any]:
     """adb install (-r to reinstall, -t to allow test apks)."""
-    if not Path(apk_path).exists():
-        return {"ok": False, "error": f"APK not found at {apk_path}"}
+    try:
+        p = safe_local_path(apk_path)
+    except ValueError:
+        return {"ok": False, "error": "invalid apk_path"}
+    if not p.exists():
+        return {"ok": False, "error": "APK not found"}
     args = ["adb"]
     if device_id:
         args += ["-s", device_id]
-    args += ["install", "-r", "-t", apk_path]
+    args += ["install", "-r", "-t", str(p)]
     rc, out, err = await _run(args, timeout=120)
     return {
         "ok": rc == 0 and "Success" in out,
@@ -316,8 +323,9 @@ async def verify_visual(
 
     try:
         from .vision import describe_image, is_vision_available  # local import to avoid circular
-    except Exception as exc:
-        return {"ok": False, "error": f"vision backend unavailable: {exc}"}
+    except Exception:
+        log.warning("vision backend import failed", exc_info=True)
+        return {"ok": False, "error": "vision backend unavailable"}
 
     if not await is_vision_available():
         return {

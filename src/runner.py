@@ -75,26 +75,26 @@ def _grant_deploy_secret_access(repo: str) -> bool:
         log.warning("invalid repo id for %s: %r", repo, repo_id)
         return False
 
-    secrets = [
+    secret_names = [
         "JARVIS_DEPLOY_SSH_KEY",
         "JARVIS_DEPLOY_HOST",
         "JARVIS_DEPLOY_BASE_PATH",
         "JARVIS_DEPLOY_DOMAIN",
     ]
     all_ok = True
-    for secret in secrets:
+    for secret_name in secret_names:
         try:
             _sh([
                 "gh", "api", "--method", "PUT",
-                f"/orgs/{GITHUB_ORG}/actions/secrets/{secret}/repositories/{repo_id}",
+                f"/orgs/{GITHUB_ORG}/actions/secrets/{secret_name}/repositories/{repo_id}",
             ])
-            log.info("enrolled %s in org secret %s", repo, secret)
+            log.info("enrolled %s in org secret %s", repo, secret_name)
         except subprocess.CalledProcessError as exc:
             err = (exc.stderr or "")[:200]
             if "Not Found" in err:
-                log.info("org secret %s not configured yet (run setup-jarvis-deploy-secrets.sh)", secret)
+                log.info("org secret %s not configured yet (run setup-jarvis-deploy-secrets.sh)", secret_name)
             else:
-                log.warning("failed to enrol %s in %s: %s", repo, secret, err)
+                log.warning("failed to enrol %s in %s: %s", repo, secret_name, err)
             all_ok = False
     return all_ok
 

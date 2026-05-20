@@ -229,8 +229,9 @@ async def generate_image(
             "error": f"ComfyUI proxy not reachable at {COMFY_PROXY}",
             "diagnosis": {"kind": "proxy_down", "fix": "Start the ComfyUI overlay: docker compose -f docker-compose.yml -f docker-compose.comfyui.yml up -d"},
         }
-    except Exception as exc:
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    except Exception:
+        log.warning("comfyui image generation failed", exc_info=True)
+        return {"ok": False, "error": "image generation failed"}
 
 
 # ── Self-healing: error pattern matching ──────────────────────────────────────
@@ -293,5 +294,6 @@ async def fetch_recent_logs(lines: int = 100) -> str:
                 f"?stdout=1&stderr=1&tail={lines}",
             )
             return r.text if r.status_code == 200 else f"(could not fetch logs: HTTP {r.status_code})"
-    except Exception as exc:
-        return f"(could not fetch logs: {exc})"
+    except Exception:
+        log.warning("could not fetch comfyui container logs", exc_info=True)
+        return "(could not fetch logs)"

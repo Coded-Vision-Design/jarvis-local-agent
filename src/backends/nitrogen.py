@@ -64,8 +64,9 @@ def status() -> dict[str, Any]:
         }
     try:
         return json.loads(STATUS_FILE.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return {"state": "error", "detail": f"could not read status: {exc}"}
+    except Exception:
+        log.warning("could not read nitrogen status file", exc_info=True)
+        return {"state": "error", "detail": "could not read status file"}
 
 
 def is_available() -> bool:
