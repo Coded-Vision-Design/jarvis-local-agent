@@ -12,8 +12,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shlex
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -130,6 +132,18 @@ def _interpret_error(exc: Exception) -> tuple[str, str] | None:
             "`docker exec jarvis-agent curl -I https://api.github.com`. "
             "If it can't, the host's DNS or docker network may be misconfigured.",
         )
+    if "fetch" in haystack and "non-zero exit status 128" in haystack:
+        return (
+            "git fetch exit 128 — stale remote auth, moved origin URL, "
+            "or corrupted workspace .git. The runner now self-heals this "
+            "by re-cloning fresh on the next attempt.",
+            "Re-trigger the task. If it still fails, verify "
+            "JARVIS_AGENT_REPO_WRITE_TOKEN is set in /workspace/agent/.env "
+            "and matches a fine-grained PAT with Contents: write on the "
+            "Coded-Vision-Design org. Worst case, "
+            "`docker exec jarvis-agent rm -rf /workspace/workspaces/<repo>` "
+            "then re-trigger.",
+        )
     if "401 unauthorized" in haystack or "bad credentials" in haystack:
         return (
             "GitHub API returned 401 — the token is invalid or revoked.",
@@ -243,32 +257,83 @@ def _create_private_repo(repo: str, target: Path) -> Path:
     return target
 
 
+def _origin_url(repo: str) -> str:
+    """Prefer HTTPS with the PAT baked in over SSH.
+
+    HTTPS works whenever the agent has a valid PAT in env; SSH needs a
+    deploy key that's been added to the org. The container often only
+    has one or the other; HTTPS is the safer default. The fine-grained
+    JARVIS_AGENT_REPO_WRITE_TOKEN is preferred when present (it has
+    repo + admin:org grants); otherwise fall back to GITHUB_TOKEN.
+    """
+    token = os.environ.get("JARVIS_AGENT_REPO_WRITE_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        return f"https://x-access-token:{token}@github.com/{GITHUB_ORG}/{repo}.git"
+    return f"git@github.com:{GITHUB_ORG}/{repo}.git"
+
+
 def _git_clone_or_fetch(repo: str, create_if_missing: bool = False) -> Path:
-    """Ensure the workspace exists and is on origin/main. Returns the path."""
+    """Ensure the workspace exists and is on origin/main. Returns the path.
+
+    Self-heal: if the fetch/clone fails with exit 128 (typically a
+    stale auth setup, deleted remote branch, or moved origin URL),
+    nuke the workspace and re-clone from scratch. Exit 128 is the
+    signal we use; finer-grained classification lives in
+    `_interpret_error`.
+    """
     target = settings.workspace_root / "workspaces" / repo
     target.parent.mkdir(parents=True, exist_ok=True)
-    if not (target / ".git").exists():
-        url = f"git@github.com:{GITHUB_ORG}/{repo}.git"
+    url = _origin_url(repo)
+
+    def _fresh_clone() -> Path:
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
         try:
             _sh(["git", "clone", url, str(target)])
         except subprocess.CalledProcessError as exc:
             if create_if_missing and (
-                "not found" in exc.stderr.lower()
-                or "repository" in exc.stderr.lower()
+                "not found" in (exc.stderr or "").lower()
+                or "repository" in (exc.stderr or "").lower()
                 or exc.returncode == 128
             ):
                 return _create_private_repo(repo, target)
             raise
-    else:
+        return target
+
+    if not (target / ".git").exists():
+        return _fresh_clone()
+
+    # Refresh origin URL so a previously-cloned SSH workspace still
+    # works after we flipped the default to HTTPS-with-PAT.
+    try:
+        _sh(["git", "remote", "set-url", "origin", url], cwd=target)
+    except subprocess.CalledProcessError:
+        # Not fatal — fetch will surface the real error below.
+        pass
+
+    try:
         _sh(["git", "fetch", "--prune", "origin"], cwd=target)
-        # Hard-reset main to origin/main so we always start fresh.
-        # If there's no main, try master.
-        try:
-            _sh(["git", "checkout", "main"], cwd=target)
-            _sh(["git", "reset", "--hard", "origin/main"], cwd=target)
-        except subprocess.CalledProcessError:
-            _sh(["git", "checkout", "master"], cwd=target)
-            _sh(["git", "reset", "--hard", "origin/master"], cwd=target)
+    except subprocess.CalledProcessError as exc:
+        # Exit 128 on fetch usually means stale auth / moved remote /
+        # corrupted .git. Nuke + re-clone is the cheap fix; the next
+        # task can resume cleanly.
+        if exc.returncode == 128:
+            log.warning(
+                "git fetch exit 128 in %s — re-cloning from scratch (stderr=%s)",
+                target,
+                (exc.stderr or "")[:240],
+            )
+            return _fresh_clone()
+        raise
+
+    # Hard-reset main to origin/main so we always start fresh.
+    # If there's no main, try master.
+    try:
+        _sh(["git", "checkout", "main"], cwd=target)
+        _sh(["git", "reset", "--hard", "origin/main"], cwd=target)
+    except subprocess.CalledProcessError:
+        _sh(["git", "checkout", "master"], cwd=target)
+        _sh(["git", "reset", "--hard", "origin/master"], cwd=target)
     return target
 
 
