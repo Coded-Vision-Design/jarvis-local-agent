@@ -52,6 +52,93 @@ def _sh(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subproce
     )
 
 
+def _interpret_error(exc: Exception) -> tuple[str, str] | None:
+    """Pattern-match common runner exceptions to a (diagnosis, recommended_action)
+    pair. Returns None when no pattern matches — caller falls back to the raw
+    traceback. The goal is to turn 'runner exception: CalledProcessError ...'
+    into something the operator can act on without docker-exec-ing into the
+    container.
+
+    Captured patterns (extend as new failure modes surface):
+      - gh repo create permission denied (token scope / resource owner)
+      - gh PAT enterprise lifetime cap
+      - gh / git not authenticated
+      - git push rejected (non-fast-forward)
+      - git clone permission denied (private repo not accessible)
+      - docker daemon not running
+      - DNS / network unreachable
+      - disk full (no space left on device)
+    """
+    msg = str(exc)
+    stderr = getattr(exc, "stderr", "") or ""
+    haystack = f"{msg}\n{stderr}".lower()
+
+    if "createrepository" in haystack and "permissions" in haystack:
+        return (
+            "gh repo create refused — the GITHUB_TOKEN doesn't have "
+            "'Administration: write' on the Coded-Vision-Design org.",
+            "Generate a fine-grained PAT with Resource owner = Coded-Vision-Design, "
+            "Administration: Read and write (+ Contents / PRs / Workflows). "
+            "Update GITHUB_TOKEN and JARVIS_AGENT_REPO_WRITE_TOKEN in /workspace/agent/.env, "
+            "then `docker compose up -d --force-recreate jarvis-agent`.",
+        )
+    if "forbids access via" in haystack and "fine-grained" in haystack and "lifetime" in haystack:
+        return (
+            "GitHub PAT exceeds the enterprise's max lifetime (366 days).",
+            "Edit the token at https://github.com/settings/personal-access-tokens, "
+            "set expiry to ≤ 12 months, save, and re-paste the same value into "
+            "/workspace/agent/.env.",
+        )
+    if "name already exists on this account" in haystack:
+        return (
+            "Repo name already taken on Coded-Vision-Design.",
+            "Pick a different repo name in the task body, OR if you intended "
+            "to reuse the existing repo, set metadata.local_agent_create_repo=false "
+            "and the runner will clone the existing one instead of trying to create it.",
+        )
+    if "permission denied" in haystack and ("git@github" in haystack or "ssh" in haystack):
+        return (
+            "git clone failed with SSH permission denied — the SSH key in "
+            "/root/.ssh isn't trusted by GitHub for this repo.",
+            "Verify the key with `docker exec jarvis-agent ssh -T git@github.com`. "
+            "Add the public key to https://github.com/settings/keys if missing.",
+        )
+    if "non-fast-forward" in haystack or "rejected" in haystack and "push" in haystack:
+        return (
+            "git push rejected — the remote branch has commits the local "
+            "branch doesn't have.",
+            "Run `git pull --rebase origin <branch>` from the workspace, "
+            "resolve any conflicts, then push again. Usually means another agent "
+            "or operator pushed to the same branch.",
+        )
+    if "cannot connect to the docker daemon" in haystack:
+        return (
+            "Docker daemon isn't reachable from inside the agent container.",
+            "Ensure /var/run/docker.sock is bind-mounted in docker-compose.yml "
+            "and the host docker engine is running.",
+        )
+    if "no space left on device" in haystack:
+        return (
+            "Host disk is full — the agent couldn't write to its workspace.",
+            "Run the prune-disk workflow on cdv-vps-ops to reclaim docker image "
+            "and buildkit cache space. Aggressive mode if the gentle prune isn't enough.",
+        )
+    if "could not resolve host" in haystack or "name or service not known" in haystack:
+        return (
+            "Network / DNS lookup failed.",
+            "Check the agent container can reach the internet: "
+            "`docker exec jarvis-agent curl -I https://api.github.com`. "
+            "If it can't, the host's DNS or docker network may be misconfigured.",
+        )
+    if "401 unauthorized" in haystack or "bad credentials" in haystack:
+        return (
+            "GitHub API returned 401 — the token is invalid or revoked.",
+            "Re-generate the PAT at https://github.com/settings/personal-access-tokens, "
+            "update /workspace/agent/.env and recreate the container.",
+        )
+    return None
+
+
 def _grant_deploy_secret_access(repo: str) -> bool:
     """Add this repo to the selected list for the JARVIS_DEPLOY_* org secrets.
 
@@ -954,11 +1041,25 @@ async def run_job(task: dict[str, Any]) -> None:
         # docker logs via log.exception above.
         exc_kind = type(e).__name__
         exc_msg = str(e)[:600] or "(no message)"
-        await client.append_run(task_id, "error", {
-            "message": f"runner exception: {exc_kind}: {exc_msg}",
-            "exception": str(e),
-            "exception_type": exc_kind,
-        })
+        # Self-diagnose common failures into a (diagnosis, recommended_action)
+        # pair. When the heuristic fires we surface a useful sentence at the
+        # top of the operator's activity log instead of just the traceback.
+        interpretation = _interpret_error(e)
+        if interpretation is not None:
+            diagnosis, action = interpretation
+            await client.append_run(task_id, "error", {
+                "message": f"{diagnosis} → {action}",
+                "diagnosis": diagnosis,
+                "recommended_action": action,
+                "exception": str(e),
+                "exception_type": exc_kind,
+            })
+        else:
+            await client.append_run(task_id, "error", {
+                "message": f"runner exception: {exc_kind}: {exc_msg}",
+                "exception": str(e),
+                "exception_type": exc_kind,
+            })
         # Phase 19 blocked-note (exception path). Best-effort; if note
         # generation itself fails too we still flip status + alert.
         # NOTE: write_handover is a nested closure defined inside the try
@@ -966,19 +1067,29 @@ async def run_job(task: dict[str, Any]) -> None:
         # that point (e.g. clone or scaffold crashed). Call emit_handover_note
         # directly to dodge the binding issue.
         try:
+            note_artefacts: dict[str, Any] = {
+                "exception": str(e)[:400],
+                "exception_type": exc_kind,
+            }
+            if interpretation is not None:
+                note_artefacts["diagnosis"] = interpretation[0]
+                note_artefacts["recommended_action"] = interpretation[1]
             await emit_handover_note(
                 client, task, "blocked", backend_name,
                 context={"user_steer": metadata.get("last_user_steer", "")},
-                artefacts={
-                    "exception": str(e)[:400],
-                    "exception_type": exc_kind,
-                },
+                artefacts=note_artefacts,
             )
         except Exception:
             log.exception("blocked-note emit failed during exception handler")
         await client.set_status(task_id, "blocked")
+        # Discord alert — prefer the diagnosis when available.
+        alert_summary = (
+            f"`{interpretation[0]}`\n→ {interpretation[1]}"
+            if interpretation is not None
+            else f"`{exc_kind}: {str(e)[:200]}`"
+        )
         await post_as_jarvis(
-            f"💥 Task #{task_id} crashed in the local agent: `{exc_kind}: {str(e)[:200]}`"
+            f"💥 Task #{task_id} crashed in the local agent: {alert_summary}"
         )
     finally:
         stop_hb.set()
