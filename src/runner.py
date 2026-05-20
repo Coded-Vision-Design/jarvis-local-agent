@@ -31,7 +31,7 @@ from .state import bus, inject_queues, slots
 
 log = logging.getLogger("jarvis-agent.runner")
 
-GITHUB_ORG = "codedvisiondesign"  # matches CLAUDE.md / .env defaults
+GITHUB_ORG = "Coded-Vision-Design"  # canonical org slug; GitHub is case-insensitive but `gh repo create` and the SSH path need exact match
 MAX_HEAL_ATTEMPTS = 3             # max self-healing retry cycles per task
 
 
@@ -948,22 +948,37 @@ async def run_job(task: dict[str, Any]) -> None:
 
     except Exception as e:
         log.exception("run_job crashed")
+        # Surface the actual exception text in the operator-visible activity
+        # log so the user doesn't have to docker-exec into the agent to find
+        # the traceback. Cap at 600 chars — long stack traces still go to
+        # docker logs via log.exception above.
+        exc_kind = type(e).__name__
+        exc_msg = str(e)[:600] or "(no message)"
         await client.append_run(task_id, "error", {
-            "message": "runner exception",
+            "message": f"runner exception: {exc_kind}: {exc_msg}",
             "exception": str(e),
+            "exception_type": exc_kind,
         })
         # Phase 19 blocked-note (exception path). Best-effort; if note
         # generation itself fails too we still flip status + alert.
+        # NOTE: write_handover is a nested closure defined inside the try
+        # block, so it's UnboundLocal here if the exception fired before
+        # that point (e.g. clone or scaffold crashed). Call emit_handover_note
+        # directly to dodge the binding issue.
         try:
-            await write_handover("blocked", artefacts={
-                "exception": str(e)[:400],
-                "exception_type": type(e).__name__,
-            })
+            await emit_handover_note(
+                client, task, "blocked", backend_name,
+                context={"user_steer": metadata.get("last_user_steer", "")},
+                artefacts={
+                    "exception": str(e)[:400],
+                    "exception_type": exc_kind,
+                },
+            )
         except Exception:
             log.exception("blocked-note emit failed during exception handler")
         await client.set_status(task_id, "blocked")
         await post_as_jarvis(
-            f"💥 Task #{task_id} crashed in the local agent: `{type(e).__name__}: {str(e)[:200]}`"
+            f"💥 Task #{task_id} crashed in the local agent: `{exc_kind}: {str(e)[:200]}`"
         )
     finally:
         stop_hb.set()
