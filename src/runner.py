@@ -542,23 +542,56 @@ async def run_job(task: dict[str, Any]) -> None:
     # before the backend ever sees it, so the whitelist check is
     # redundant (and would block the very flow it should enable).
     #
-    # Heuristic fallback: if the task body explicitly asks to create the
-    # repo ("create the repo", "scaffold a new", "if the repo doesn't
-    # exist yet, create it") we infer the scaffold intent. False positives
-    # only matter if the repo name collides with something real on the
-    # CVD org — gh repo create errors out cleanly in that case.
+    # Heuristic fallback: detect when the task body implies the operator
+    # wants a new repo scaffolded. We split signals into two tiers:
+    #
+    #   STRONG hints — explicit "create the repo if missing" phrasings.
+    #   Any one of these is enough on its own.
+    #
+    #   SCAFFOLD hints — common build-and-ship phrasings ("build a
+    #   website", "scaffold", "deploy to vercel", "open a PR"). On their
+    #   own a SCAFFOLD hint isn't enough — but combined with `repo`
+    #   missing from the whitelist (no pre-existing repo with that
+    #   name), it's the cleanest possible signal that the operator
+    #   expects scaffold mode. Two SCAFFOLD hints together also trigger.
+    #
+    # False positives only matter if the repo name collides with something
+    # real on the CVD org — `gh repo create` errors out cleanly in that
+    # case, and the runner falls back to clone-existing.
     scaffold_requested = bool(metadata.get("local_agent_create_repo"))
     if not scaffold_requested and isinstance(body, str):
         body_lower = body.lower()
-        scaffold_hints = (
+        strong_hints = (
             "if the repo doesn't exist yet, create it",
             "if the repo doesn't exist, create it",
             "create the repo if it doesn't exist",
             "scaffold a new",
             "scaffold the repo",
+            "private is fine",
+            "private repo is fine",
         )
-        if any(h in body_lower for h in scaffold_hints):
+        scaffold_hints = (
+            "build a polished",
+            "build a one-page",
+            "build a portfolio",
+            "build a demo",
+            "build a landing page",
+            "build a website",
+            "build the website",
+            "scaffold",
+            "deploy to vercel",
+            "open a pr against main",
+            "open a pr when done",
+            "deploy-ready",
+        )
+        repo_unknown = not (repo and is_whitelisted(str(repo)))
+        if any(h in body_lower for h in strong_hints):
             scaffold_requested = True
+        else:
+            hits = sum(1 for h in scaffold_hints if h in body_lower)
+            if hits >= 2 or (hits >= 1 and repo_unknown):
+                scaffold_requested = True
+        if scaffold_requested:
             metadata["local_agent_create_repo"] = True
 
     if not repo or (not is_whitelisted(str(repo)) and not scaffold_requested):
