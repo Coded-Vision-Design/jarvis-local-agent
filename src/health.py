@@ -29,7 +29,7 @@ from .repos import load_repos
 
 log = logging.getLogger("jarvis-agent.health")
 
-GITHUB_ORG = "codedvisiondesign"
+GITHUB_ORG = "Coded-Vision-Design"
 DEDUP_FILE = Path("/workspace/agent/.health_seen.json")
 DEDUP_TTL_SECONDS = 86400  # 24 hours
 
