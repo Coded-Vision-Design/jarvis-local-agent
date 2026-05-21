@@ -251,8 +251,11 @@ def _scaffold_astro(workspace: Path, repo_name: str) -> list[str]:
     written.append(_write(workspace, "src/pages/index.astro", (
         "---\n"
         "// Replace this stub. Build the site requested in the task body.\n"
+        "// The HTML comment marker below is detected by the cloud-side\n"
+        "// deploy probe; leaving it intact = task auto-fails as a stub deploy.\n"
         "const title = 'Coming soon'\n"
         "---\n"
+        "<!-- jarvis-scaffold-placeholder -->\n"
         "<html lang=\"en-GB\">\n"
         "  <head>\n"
         "    <meta charset=\"utf-8\" />\n"
@@ -345,6 +348,7 @@ def _scaffold_next_static_export(workspace: Path, repo_name: str) -> list[str]:
         "export default function RootLayout({ children }: { children: ReactNode }) {\n"
         "  return (\n"
         "    <html lang=\"en-GB\">\n"
+        "      {/* jarvis-scaffold-placeholder — detected by deploy probe */}\n"
         "      <body>{children}</body>\n"
         "    </html>\n"
         "  )\n"
@@ -352,6 +356,8 @@ def _scaffold_next_static_export(workspace: Path, repo_name: str) -> list[str]:
     )))
     written.append(_write(workspace, "app/page.tsx", (
         "// Replace this stub. Build the site requested in the task body.\n"
+        "// The comment marker in layout.tsx is detected by the cloud deploy\n"
+        "// probe; leaving it intact = task auto-fails as a stub deploy.\n"
         "export default function HomePage() {\n"
         "  return (\n"
         "    <main>\n"
@@ -426,6 +432,7 @@ def _scaffold_react_vite_spa(workspace: Path, repo_name: str) -> list[str]:
     }, indent=2) + "\n"))
     written.append(_write(workspace, "index.html", (
         "<!doctype html>\n"
+        "<!-- jarvis-scaffold-placeholder -->\n"
         "<html lang=\"en-GB\">\n"
         "  <head>\n"
         "    <meta charset=\"utf-8\" />\n"
