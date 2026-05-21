@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from .agent_identity import can_run, agent_id
 from .backends import get_backend
@@ -77,6 +77,35 @@ async def _record_deliverable_links(
     if no_changes is not None:
         patch["local_agent_no_changes"] = no_changes
     await client.merge_metadata(task_id, patch)
+
+
+class WebDeployOutcome(NamedTuple):
+    """Result of npm build + VPS rsync for a web task."""
+
+    url: str | None = None
+    failure: str | None = None  # build_failed | deploy_failed
+
+
+def _deploy_ssh_cmd() -> str:
+    """SSH command for rsync/deploy.
+
+    Windows bind-mounts ``~/.ssh`` with loose permissions; OpenSSH rejects
+    private keys that are group/world-readable. Copy to /tmp with mode 600.
+    """
+    src = Path("/root/.ssh/id_ed25519")
+    cached = Path("/tmp/jarvis-deploy-ssh-key")
+    key = src
+    if src.is_file():
+        try:
+            shutil.copy2(src, cached)
+            os.chmod(cached, 0o600)
+            key = cached
+        except OSError as exc:
+            log.warning("could not cache deploy SSH key (%s), using mount", exc)
+    return (
+        f"ssh -F /dev/null -i {key} "
+        "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null"
+    )
 
 
 def error_run_payload(
@@ -627,9 +656,91 @@ def _make_branch(workspace: Path, slug: str) -> str:
     return name
 
 
+# Build outputs alone must not count as "agent shipped code" for stack gates.
+_ARTIFACT_PATH_PREFIXES = (
+    ".next/",
+    "node_modules/",
+    "out/",
+    "dist/",
+    "build/",
+    ".turbo/",
+)
+
+
 def _has_uncommitted_changes(workspace: Path) -> bool:
-    r = _sh(["git", "status", "--porcelain"], cwd=workspace)
-    return bool(r.stdout.strip())
+    """True when there are meaningful source changes (not just out/.next noise)."""
+    r = _sh(["git", "status", "--porcelain", "-u"], cwd=workspace)
+    for line in r.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        path = line[3:].strip().strip('"')
+        if path.endswith("tsconfig.tsbuildinfo"):
+            continue
+        if any(
+            path.startswith(prefix) or path == prefix.rstrip("/")
+            for prefix in _ARTIFACT_PATH_PREFIXES
+        ):
+            continue
+        return True
+    return False
+
+
+def _restore_next_scaffold_from_origin(workspace: Path) -> str | None:
+    """Restore Next.js scaffold files from the newest origin/jarvis/* branch.
+
+    Handles branches whose HEAD is only CLAUDE.md while an older jarvis branch
+    still has the full static-export tree.
+    """
+    if (workspace / "package.json").exists():
+        return None
+    try:
+        _sh(["git", "fetch", "origin"], cwd=workspace)
+    except subprocess.CalledProcessError:
+        log.warning("git fetch failed before scaffold restore")
+    try:
+        r = _sh(
+            [
+                "git",
+                "for-each-ref",
+                "--sort=-committerdate",
+                "--format=%(refname:short)",
+                "refs/remotes/origin/jarvis/",
+            ],
+            cwd=workspace,
+        )
+    except subprocess.CalledProcessError:
+        return None
+    branches = [b.strip() for b in r.stdout.splitlines() if b.strip()]
+    restore_paths = [
+        "package.json",
+        "package-lock.json",
+        "next.config.mjs",
+        "next.config.ts",
+        "next.config.js",
+        "postcss.config.mjs",
+        "tsconfig.json",
+        ".gitignore",
+        "app",
+        "public",
+        "tests",
+    ]
+    for ref in branches:
+        remote = ref if ref.startswith("origin/") else f"origin/{ref}"
+        branch = remote.removeprefix("origin/")
+        probe = subprocess.run(
+            ["git", "cat-file", "-e", f"{remote}:package.json"],
+            cwd=str(workspace),
+            capture_output=True,
+        )
+        if probe.returncode != 0:
+            continue
+        try:
+            _sh(["git", "checkout", remote, "--", *restore_paths], cwd=workspace)
+            log.info("restored Next scaffold from %s into %s", remote, workspace)
+            return branch  # jarvis/... without origin/ prefix
+        except subprocess.CalledProcessError:
+            continue
+    return None
 
 
 def _head_commit_shas(workspace: Path, limit: int = 8) -> list[str]:
@@ -869,6 +980,81 @@ def _build_web_project(workspace: Path) -> Path | None:
     return _detect_build_output(workspace)
 
 
+async def _build_and_deploy_web_task(
+    client: Any,
+    task_id: int,
+    workspace: Path,
+    repo: str,
+    branch: str,
+    metadata: dict[str, Any],
+) -> WebDeployOutcome:
+    """Run production build + VPS rsync."""
+    should_deploy = (
+        settings.deploy_enabled
+        and metadata.get("local_agent_deploy", True) is not False
+        and await asyncio.to_thread(_looks_like_web_project, workspace)
+    )
+    if not should_deploy:
+        return WebDeployOutcome()
+
+    await client.append_run(task_id, "jarvis_note", {
+        "message": "web project detected - building and deploying to VPS",
+    })
+    dist_dir = await asyncio.to_thread(_build_web_project, workspace)
+    if dist_dir is None:
+        await client.append_run(
+            task_id,
+            "error",
+            error_run_payload(
+                reason="build_failed",
+                message=(
+                    "npm build failed or produced no dist/out folder — "
+                    "check package.json scripts and next.config export settings"
+                ),
+            ),
+        )
+        return WebDeployOutcome(failure="build_failed")
+
+    deploy_url = await asyncio.to_thread(_deploy_to_vps, str(repo), dist_dir)
+    if not deploy_url:
+        await client.append_run(
+            task_id,
+            "error",
+            error_run_payload(
+                reason="deploy_failed",
+                message=(
+                    "deploy to VPS failed (rsync/SSH). On Windows hosts, ensure "
+                    "/root/.ssh/id_ed25519 is readable and DEPLOY_HOST is reachable"
+                ),
+            ),
+        )
+        return WebDeployOutcome(failure="deploy_failed")
+
+    await asyncio.to_thread(_update_readme_with_url, workspace, deploy_url)
+    try:
+        if await asyncio.to_thread(_has_uncommitted_changes, workspace):
+            await asyncio.to_thread(_sh, ["git", "add", "README.md"], cwd=workspace)
+            await asyncio.to_thread(
+                _sh,
+                [
+                    "git",
+                    "-c", "user.email=contact@codedvisiondesign.co.uk",
+                    "-c", "user.name=Coded Vision Design",
+                    "commit",
+                    "-m", f"docs: add live site URL ({deploy_url})",
+                ],
+                cwd=workspace,
+            )
+            await asyncio.to_thread(_sh, ["git", "push", "origin", branch], cwd=workspace)
+    except Exception:
+        log.exception("failed to commit README deploy URL")
+
+    await client.append_run(task_id, "jarvis_note", {
+        "message": f"deployed to {deploy_url}",
+    })
+    return WebDeployOutcome(url=deploy_url)
+
+
 def _deploy_to_vps(repo: str, dist_dir: Path) -> str | None:
     """Rsync the built dist directory to the VPS subdomain folder.
 
@@ -885,7 +1071,7 @@ def _deploy_to_vps(repo: str, dist_dir: Path) -> str | None:
     remote_staging = f"{remote_base}/.{slug}.staging"
     url = f"https://{slug}.{settings.deploy_domain}"
 
-    ssh_cmd = "ssh -i /root/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new"
+    ssh_cmd = _deploy_ssh_cmd()
 
     try:
         # Stage to a sibling directory, then atomically swap
@@ -1155,7 +1341,9 @@ async def run_job(task: dict[str, Any]) -> None:
 
             from .stack_policy import (
                 contract_from_metadata,
+                format_stack_failure_message,
                 format_stack_prompt_block,
+                pre_scaffold_workspace,
                 should_validate_stack,
                 validate_workspace_against_contract,
             )
@@ -1170,6 +1358,28 @@ async def run_job(task: dict[str, Any]) -> None:
                         f"({stack_contract.get('label', '')})"
                     ),
                 })
+                # When the workspace is empty (fresh repo) and the
+                # profile requires specific files, drop a minimal
+                # skeleton so Claude has a starting point and the
+                # validator can find the required-paths even if Claude
+                # underdelivers. No-op for inherit-repo / ops-bash /
+                # python-fastapi and for workspaces that already have a
+                # package.json.
+                scaffold_files = await asyncio.to_thread(
+                    pre_scaffold_workspace,
+                    workspace,
+                    stack_contract,
+                    str(repo),
+                )
+                if scaffold_files:
+                    await client.append_run(task_id, "jarvis_note", {
+                        "message": (
+                            f"pre-scaffolded {len(scaffold_files)} files for "
+                            f"{stack_contract.get('profile_id')}: "
+                            f"{', '.join(scaffold_files[:6])}"
+                            f"{'…' if len(scaffold_files) > 6 else ''}"
+                        ),
+                    })
 
             # Phase 19 — track tool calls + errors for the auto-note
             # context. Capped to recent N so the note prompt stays small.
@@ -1313,20 +1523,35 @@ async def run_job(task: dict[str, Any]) -> None:
                 return
 
             changed = await asyncio.to_thread(_has_uncommitted_changes, workspace)
+            if stack_contract and should_validate_stack(task, metadata):
+                if stack_contract.get("profile_id") == "next-static-export":
+                    restored = await asyncio.to_thread(
+                        _restore_next_scaffold_from_origin, workspace,
+                    )
+                    if restored:
+                        await client.append_run(task_id, "jarvis_note", {
+                            "message": (
+                                f"restored Next.js scaffold from origin/{restored} "
+                                "(branch HEAD was missing package.json / app/)"
+                            ),
+                        })
             if changed and stack_contract and should_validate_stack(task, metadata):
                 stack_ok, stack_failures = await asyncio.to_thread(
                     validate_workspace_against_contract, workspace, stack_contract,
                 )
                 if not stack_ok:
+                    profile = stack_contract.get("profile_id")
                     await client.append_run(
                         task_id,
                         "error",
                         error_run_payload(
                             reason="stack_mismatch",
-                            message="Workspace does not match the resolved stack contract.",
+                            message=format_stack_failure_message(
+                                stack_failures, str(profile) if profile else None,
+                            ),
                             error="; ".join(stack_failures)[:2000],
                             failures=stack_failures,
-                            profile_id=stack_contract.get("profile_id"),
+                            profile_id=profile,
                         ),
                     )
                     await write_handover("blocked", artefacts={
@@ -1342,7 +1567,156 @@ async def run_job(task: dict[str, Any]) -> None:
                     return
 
             if not changed:
-                from .task_evidence import no_changes_should_block
+                from .task_evidence import is_build_class_task, no_changes_should_block
+
+                async def _finish_prefilled_deploy(outcome: WebDeployOutcome) -> bool:
+                    """Complete a build-class task from existing scaffold. Return True if done."""
+                    if not outcome.url:
+                        return False
+                    deploy_url = outcome.url
+                    title = (task.get("title") or "jarvis: delegated change").split("\n")[0]
+                    pr_body = (
+                        f"Delegated by Jarvis (task #{task_id}, backend={backend_name}).\n\n"
+                        f"**Request:**\n\n{body[:4000]}\n\n"
+                        f"**Note:** Site built from existing scaffold on branch `{branch}`.\n"
+                    )
+                    pr_url = await asyncio.to_thread(_open_pr, workspace, title, pr_body)
+                    await _record_deliverable_links(
+                        client,
+                        task_id,
+                        str(repo),
+                        branch=branch,
+                        pr_url=pr_url or None,
+                        deploy_url=deploy_url,
+                        no_changes=False,
+                    )
+                    elapsed = int(time.time() - started)
+                    await write_handover("done", artefacts={
+                        "pr_url": pr_url,
+                        "branch": branch,
+                        "deploy_url": deploy_url,
+                        "commits": await asyncio.to_thread(_head_commit_shas, workspace),
+                        "time_spent_seconds": elapsed,
+                        "spent_pence": result.spent_pence,
+                        "prefilled_scaffold": True,
+                    })
+                    await client.set_status(
+                        task_id,
+                        "done",
+                        spent_pence=result.spent_pence,
+                        spent_tokens=result.spent_tokens,
+                    )
+                    mins, secs = divmod(elapsed, 60)
+                    elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+                    msg = (
+                        f"✅ **Task #{task_id}** ({backend_name}, `{repo}`)\n"
+                        f"Branch `{branch}` · scaffold deploy · {elapsed_str}\n"
+                        f"🌐 Live: <{deploy_url}>"
+                    )
+                    if pr_url:
+                        msg += f" · PR <{pr_url}>"
+                    await post_as_jarvis(msg)
+                    return True
+
+                async def _block_web_failure(
+                    failure: str,
+                    *,
+                    prefilled: bool,
+                ) -> None:
+                    messages = {
+                        "build_failed": (
+                            "Build failed or produced no output folder (dist/out). "
+                            "Fix package.json / next.config, then retry."
+                        ),
+                        "deploy_failed": (
+                            "Deploy to VPS failed (rsync/SSH). Check agent logs and "
+                            "DEPLOY_HOST / SSH key on the workstation."
+                        ),
+                    }
+                    msg = messages.get(failure, "Web build or deploy failed.")
+                    elapsed = int(time.time() - started)
+                    await write_handover("blocked", artefacts={
+                        "time_spent_seconds": elapsed,
+                        "no_changes": True,
+                        "spent_pence": result.spent_pence,
+                        "block_reason": failure,
+                        "prefilled_scaffold": prefilled,
+                    })
+                    await client.set_status(task_id, "blocked")
+                    await post_as_jarvis(
+                        f"⚠️ Task #{task_id} ({backend_name}, `{repo}`) blocked — "
+                        f"{failure.replace('_', ' ')}. _{elapsed}s_"
+                    )
+
+                # Pre-scaffolded repo: agent may no-op while workspace already
+                # satisfies the stack contract — still build + deploy.
+                if is_build_class_task(task):
+                    stack_ok = True
+                    stack_failures: list[str] = []
+                    if stack_contract and should_validate_stack(task, metadata):
+                        if stack_contract.get("profile_id") == "next-static-export":
+                            restored = await asyncio.to_thread(
+                                _restore_next_scaffold_from_origin, workspace,
+                            )
+                            if restored:
+                                await client.append_run(task_id, "jarvis_note", {
+                                    "message": (
+                                        f"restored Next.js scaffold from origin/{restored} "
+                                        "(branch HEAD was missing package.json / app/)"
+                                    ),
+                                })
+                        stack_ok, stack_failures = await asyncio.to_thread(
+                            validate_workspace_against_contract,
+                            workspace,
+                            stack_contract,
+                        )
+                        if not stack_ok:
+                            profile = stack_contract.get("profile_id")
+                            await client.append_run(
+                                task_id,
+                                "error",
+                                error_run_payload(
+                                    reason="stack_mismatch",
+                                    message=format_stack_failure_message(
+                                        stack_failures,
+                                        str(profile) if profile else None,
+                                    ),
+                                    error="; ".join(stack_failures)[:2000],
+                                    failures=stack_failures,
+                                    profile_id=profile,
+                                ),
+                            )
+                            await write_handover("blocked", artefacts={
+                                "stack_profile": stack_contract.get("profile_id"),
+                                "validation_errors": stack_failures,
+                            })
+                            await client.set_status(task_id, "blocked")
+                            await post_as_jarvis(
+                                f"⚠️ Task #{task_id} blocked — stack mismatch "
+                                f"({stack_contract.get('profile_id')}): "
+                                f"{stack_failures[0][:200]}"
+                            )
+                            return
+
+                    if stack_ok and await asyncio.to_thread(
+                        _looks_like_web_project, workspace
+                    ):
+                        await client.append_run(task_id, "jarvis_note", {
+                            "message": (
+                                "workspace already matches stack contract — "
+                                "building and deploying without new agent edits"
+                            ),
+                        })
+                        outcome = await _build_and_deploy_web_task(
+                            client, task_id, workspace, str(repo), branch, metadata,
+                        )
+                        if await _finish_prefilled_deploy(outcome):
+                            return
+                        if outcome.failure:
+                            await _block_web_failure(
+                                outcome.failure, prefilled=True,
+                            )
+                            return
 
                 should_block, block_reason = no_changes_should_block(
                     task, backend_name=backend_name,
@@ -1429,61 +1803,20 @@ async def run_job(task: dict[str, Any]) -> None:
                 and await asyncio.to_thread(_looks_like_web_project, workspace)
             )
             if should_deploy:
-                await client.append_run(task_id, "jarvis_note", {
-                    "message": "web project detected - building and deploying to VPS",
-                })
-                dist_dir = await asyncio.to_thread(_build_web_project, workspace)
-                if dist_dir is not None:
-                    deploy_url = await asyncio.to_thread(_deploy_to_vps, str(repo), dist_dir)
-                    if deploy_url:
-                        await asyncio.to_thread(_update_readme_with_url, workspace, deploy_url)
-                        # Commit and push the README update onto the same branch
-                        try:
-                            await asyncio.to_thread(
-                                _sh,
-                                ["git", "add", "README.md"],
-                                workspace,
-                            )
-                            await asyncio.to_thread(
-                                _sh,
-                                ["git", "-c", "user.email=contact@codedvisiondesign.co.uk",
-                                 "-c", "user.name=Coded Vision Design",
-                                 "commit", "-m", f"docs: add live site URL ({deploy_url})"],
-                                workspace,
-                            )
-                            await asyncio.to_thread(
-                                _sh,
-                                ["git", "push", "origin", branch],
-                                workspace,
-                            )
-                        except Exception:
-                            log.exception("failed to commit README deploy URL")
-
-                        await _record_deliverable_links(
-                            client,
-                            task_id,
-                            str(repo),
-                            branch=branch,
-                            pr_url=pr_url or None,
-                            deploy_url=deploy_url,
-                            no_changes=False,
-                        )
-                        await client.append_run(task_id, "jarvis_note", {
-                            "message": f"deployed to {deploy_url}",
-                        })
-                    else:
-                        await client.append_run(
-                            task_id,
-                            "error",
-                            error_run_payload(
-                                reason="deploy_failed",
-                                message="deploy to VPS failed - see logs",
-                            ),
-                        )
-                else:
-                    await client.append_run(task_id, "jarvis_note", {
-                        "message": "no build output found - skipping deploy",
-                    })
+                deploy_outcome = await _build_and_deploy_web_task(
+                    client, task_id, workspace, str(repo), branch, metadata,
+                )
+                deploy_url = deploy_outcome.url
+                if deploy_url:
+                    await _record_deliverable_links(
+                        client,
+                        task_id,
+                        str(repo),
+                        branch=branch,
+                        pr_url=pr_url or None,
+                        deploy_url=deploy_url,
+                        no_changes=False,
+                    )
 
             elapsed = int(time.time() - started)
             commit_shas = await asyncio.to_thread(_head_commit_shas, workspace)
