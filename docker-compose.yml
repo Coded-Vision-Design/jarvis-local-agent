@@ -65,8 +65,16 @@ services:
       # claude.py to keep the runner on subscription). RW lets the
       # subscription auth stay live indefinitely.
       - C:/Users/djohn/.claude:/root/.claude
+      # Main config file — code-server already mounts this; agent needs it too
+      # or `claude -p` exits before OAuth/subscription auth is found.
+      - C:/Users/djohn/.claude.json:/root/.claude.json
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:17920/health', timeout=2).status==200 else 1)"]
+      # Use 127.0.0.1 not localhost - urllib resolves localhost to ::1 first,
+      # and uvicorn binds IPv4 only, so the IPv6 attempt hangs for the full
+      # timeout. Direct IPv4 address bypasses the resolution entirely.
+      # /health probes vLLM + Claude + VPS in parallel; first call after start
+      # routinely takes ~2s. 8s timeout is generous and stops Docker thrashing.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:17920/health', timeout=8).status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3

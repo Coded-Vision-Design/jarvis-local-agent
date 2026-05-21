@@ -48,6 +48,26 @@ MAX_HEAL_ATTEMPTS = 3             # max self-healing retry cycles per task
 HIVE_RETRY_MAX = 3
 
 
+def error_run_payload(
+    *,
+    reason: str,
+    message: str,
+    error: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Normalise error rows for cloud Jarvis (reason/message) and legacy keys."""
+    msg = message[:2000]
+    err = (error if error is not None else message)[:2000]
+    payload: dict[str, Any] = {
+        "reason": reason[:200],
+        "message": msg,
+        "summary": msg,
+        "error": err,
+    }
+    payload.update(extra)
+    return payload
+
+
 def _slug(s: str, n: int = 40) -> str:
     s = re.sub(r"[^a-zA-Z0-9]+", "-", s.lower()).strip("-")
     return s[:n] or "task"
@@ -1136,10 +1156,15 @@ async def run_job(task: dict[str, Any]) -> None:
 
             # 4. Commit / push / PR (if there are changes)
             if not result.ok:
-                await client.append_run(task_id, "error", {
-                    "summary": result.summary,
-                    "error": result.error or "",
-                })
+                await client.append_run(
+                    task_id,
+                    "error",
+                    error_run_payload(
+                        reason="backend_failed",
+                        message=result.summary or "backend run failed",
+                        error=result.error or result.summary or "",
+                    ),
+                )
                 # Phase 19 trigger — write a structured blocked-note
                 # before flipping status so the next engineer (or the
                 # next Jarvis run) picks up knowing what stalled.
@@ -1242,9 +1267,14 @@ async def run_job(task: dict[str, Any]) -> None:
                             "message": f"deployed to {deploy_url}",
                         })
                     else:
-                        await client.append_run(task_id, "error", {
-                            "message": "deploy to VPS failed - see logs",
-                        })
+                        await client.append_run(
+                            task_id,
+                            "error",
+                            error_run_payload(
+                                reason="deploy_failed",
+                                message="deploy to VPS failed - see logs",
+                            ),
+                        )
                 else:
                     await client.append_run(task_id, "jarvis_note", {
                         "message": "no build output found - skipping deploy",
@@ -1294,19 +1324,31 @@ async def run_job(task: dict[str, Any]) -> None:
         interpretation = _interpret_error(e)
         if interpretation is not None:
             diagnosis, action = interpretation
-            await client.append_run(task_id, "error", {
-                "message": f"{diagnosis} → {action}",
-                "diagnosis": diagnosis,
-                "recommended_action": action,
-                "exception": str(e),
-                "exception_type": exc_kind,
-            })
+            await client.append_run(
+                task_id,
+                "error",
+                error_run_payload(
+                    reason=exc_kind,
+                    message=f"{diagnosis} → {action}",
+                    error=exc_msg,
+                    diagnosis=diagnosis,
+                    recommended_action=action,
+                    exception=str(e),
+                    exception_type=exc_kind,
+                ),
+            )
         else:
-            await client.append_run(task_id, "error", {
-                "message": f"runner exception: {exc_kind}: {exc_msg}",
-                "exception": str(e),
-                "exception_type": exc_kind,
-            })
+            await client.append_run(
+                task_id,
+                "error",
+                error_run_payload(
+                    reason=exc_kind,
+                    message=f"runner exception: {exc_kind}: {exc_msg}",
+                    error=exc_msg,
+                    exception=str(e),
+                    exception_type=exc_kind,
+                ),
+            )
         # ── Hive failover ────────────────────────────────────────────
         # Before we mark this task properly blocked, decide whether
         # another worker should get a swing. Infrastructure errors

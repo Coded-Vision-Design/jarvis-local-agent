@@ -105,6 +105,20 @@ def _model_tiers() -> tuple[str, ...]:
     return tiers or _DEFAULT_MODEL_TIERS
 
 
+def claude_headless_flags() -> list[str]:
+    """CLI flags for non-interactive `claude -p` in the agent container.
+
+    Claude Code 2.1+ refuses ``--dangerously-skip-permissions`` when the
+    process runs as root (uid 0). The jarvis-agent image runs as root so
+    git/workspace bind-mounts stay simple; omit the flag in that case.
+    Workspace is already confined to ``/workspace/workspaces/<repo>``.
+    """
+    flags = ["--output-format", "stream-json", "--verbose"]
+    if os.name != "posix" or os.getuid() != 0:
+        flags.append("--dangerously-skip-permissions")
+    return flags
+
+
 def _looks_rate_limited(stdout_lines: list[str], stderr_text: str) -> bool:
     """Heuristic: did the last attempt fail because of a rate / usage limit?"""
     haystack = (stderr_text + "\n" + "\n".join(stdout_lines[-20:])).lower()
@@ -198,15 +212,10 @@ class ClaudeBackend(Backend):
             global_memory_args = ["--append-system-prompt", memory_path.read_text(encoding="utf-8")]
 
         # `claude -p "<task>"` runs in non-interactive print mode.
-        # --output-format=stream-json gives us structured progress to push into task_runs.
-        # --dangerously-skip-permissions is the headless equivalent of --yolo; we accept
-        #   the risk because the workspace is sandboxed to /workspace/workspaces/<repo>.
         base_cmd = [
             "claude",
             "-p", task,
-            "--output-format", "stream-json",
-            "--verbose",
-            "--dangerously-skip-permissions",
+            *claude_headless_flags(),
             *global_memory_args,
         ]
 
