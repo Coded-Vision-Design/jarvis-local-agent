@@ -96,7 +96,7 @@ def validate_workspace_against_contract(
                     )
                 break
 
-    if profile in ("astro-static-demo", "next-static-export", "react-vite-spa"):
+    if profile == "astro-static-demo":
         src = workspace / "src"
         if src.is_dir():
             source_files = [
@@ -107,8 +107,45 @@ def validate_workspace_against_contract(
                 failures.append(
                     "scaffold looks incomplete — expected multiple source files under src/"
                 )
-        elif profile != "inherit-repo":
-            failures.append("missing src/ directory for web scaffold")
+        else:
+            failures.append("missing src/ directory for Astro scaffold")
+
+    elif profile == "react-vite-spa":
+        src = workspace / "src"
+        if src.is_dir():
+            source_files = [
+                f for f in src.rglob("*")
+                if f.is_file() and f.suffix in {".tsx", ".jsx", ".vue", ".ts", ".js"}
+            ]
+            if len(source_files) < 2:
+                failures.append(
+                    "scaffold looks incomplete — expected multiple source files under src/"
+                )
+        else:
+            failures.append("missing src/ directory for Vite scaffold")
+
+    elif profile == "next-static-export":
+        # App Router (app/) or Pages Router (pages/) — not src/ like Vite/Astro.
+        page_roots: list[Path] = []
+        for name in ("app", "pages"):
+            root = workspace / name
+            if root.is_dir():
+                page_roots.append(root)
+        if not page_roots:
+            failures.append(
+                "missing app/ or pages/ directory for Next.js static export scaffold"
+            )
+        else:
+            page_files = [
+                f for root in page_roots for f in root.rglob("*")
+                if f.is_file()
+                and f.suffix in {".tsx", ".jsx", ".ts", ".js"}
+                and (f.name.startswith("page") or f.name in {"index.tsx", "index.jsx"})
+            ]
+            if not page_files:
+                failures.append(
+                    "expected at least one route file (e.g. app/page.tsx or pages/index.tsx)"
+                )
 
     return len(failures) == 0, failures
 

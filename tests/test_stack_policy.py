@@ -53,3 +53,32 @@ def test_format_stack_prompt_block_contains_profile():
     block = format_stack_prompt_block({"profile_id": "astro-static-demo", "label": "Astro"})
     assert "stack_contract" in block
     assert "astro-static-demo" in block
+
+
+def test_validate_next_static_export_app_router_ok(tmp_path: Path):
+    ws = tmp_path
+    (ws / "package.json").write_text(
+        json.dumps({"dependencies": {"next": "^16.0.0", "react": "^19.0.0"}}),
+        encoding="utf-8",
+    )
+    (ws / "next.config.mjs").write_text(
+        "export default { output: 'export' }",
+        encoding="utf-8",
+    )
+    app = ws / "app"
+    app.mkdir()
+    (app / "page.tsx").write_text("export default function Page() { return null }", encoding="utf-8")
+    (app / "layout.tsx").write_text("export default function Layout({ children }) { return children }", encoding="utf-8")
+
+    contract = {
+        "profile_id": "next-static-export",
+        "required_deps": ["next", "react"],
+        "forbidden_deps": [],
+        "required_path_groups": [
+            ["package.json"],
+            ["next.config.mjs"],
+            ["app/page.tsx"],
+        ],
+    }
+    ok, failures = validate_workspace_against_contract(ws, contract)
+    assert ok is True, failures
