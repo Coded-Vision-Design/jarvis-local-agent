@@ -22,6 +22,7 @@ services:
       DISCORD_JARVIS_TASKS_WEBHOOK_URL: ${DISCORD_JARVIS_TASKS_WEBHOOK_URL}
       POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-5}
       HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-30}
+      HEARTBEAT_ACTIVE_INTERVAL_SECONDS: ${HEARTBEAT_ACTIVE_INTERVAL_SECONDS:-15}
       # -F /dev/null bypasses ~/.ssh/config which Windows bind-mounts present
       # as world-readable — OpenSSH refuses to load it with "Bad owner or
       # permissions on /root/.ssh/config". UserKnownHostsFile=/dev/null for
