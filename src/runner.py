@@ -36,6 +36,17 @@ log = logging.getLogger("jarvis-agent.runner")
 GITHUB_ORG = "Coded-Vision-Design"  # canonical org slug; GitHub is case-insensitive but `gh repo create` and the SSH path need exact match
 MAX_HEAL_ATTEMPTS = 3             # max self-healing retry cycles per task
 
+# ── Hive failover ────────────────────────────────────────────────────
+# When a worker hits an infrastructure-level error (git, gh, network),
+# we don't want to perma-block the task — the user's whole reason for
+# running the hive is that *another* worker should pick it up. So we
+# self-exclude in metadata.excluded_agents and flip status back to
+# 'queued'. This repeats up to HIVE_RETRY_MAX times before we give up
+# and mark the task properly blocked. Application-level failures
+# (claude exited, tests failed, etc.) still go straight to blocked —
+# rotating won't help when the work itself is busted.
+HIVE_RETRY_MAX = 3
+
 
 def _slug(s: str, n: int = 40) -> str:
     s = re.sub(r"[^a-zA-Z0-9]+", "-", s.lower()).strip("-")
@@ -165,6 +176,53 @@ def _interpret_error(exc: Exception) -> tuple[str, str] | None:
     return None
 
 
+def _is_retryable_infra_error(exc: Exception) -> bool:
+    """Decide whether this exception is an *infrastructure* failure that
+    another hive worker should retry, or a genuine code-task failure that
+    rotating wouldn't help with.
+
+    Retryable (rotate to another worker):
+      - git / gh CalledProcessError (clone/fetch/push/remote auth, etc.)
+      - DNS / network / docker-daemon issues
+      - workspace permission / disk-full
+
+    Not retryable (mark task blocked as today):
+      - Backend / Claude / Codex application errors
+      - Test failures, scaffold failures
+      - Validation / config errors that would fail on any worker
+
+    Conservative bias: when in doubt, prefer rotating. The cost of one
+    extra rotation is small; the cost of perma-blocking a healable task
+    is the user shouting at us.
+    """
+    if not isinstance(exc, subprocess.CalledProcessError):
+        return False
+    cmd = exc.cmd or []
+    if not cmd:
+        return False
+    head = cmd[0] if isinstance(cmd[0], str) else str(cmd[0])
+    head = head.rsplit("/", 1)[-1]  # tolerate "/usr/bin/git"
+    if head in ("git", "gh", "ssh", "rsync", "curl", "wget", "npm", "pnpm", "node"):
+        # npm/pnpm/node included because `npm ci` failures during the
+        # build step are usually registry / network blips. The cap on
+        # HIVE_RETRY_MAX still protects us from rotating forever.
+        return True
+    msg = str(exc)
+    stderr = getattr(exc, "stderr", "") or ""
+    haystack = f"{msg}\n{stderr}".lower()
+    network_signals = (
+        "could not resolve host",
+        "name or service not known",
+        "connection refused",
+        "no route to host",
+        "timed out",
+        "no space left on device",
+        "cannot connect to the docker daemon",
+        "permission denied",
+    )
+    return any(sig in haystack for sig in network_signals)
+
+
 def _grant_deploy_secret_access(repo: str) -> bool:
     """Add this repo to the selected list for the JARVIS_DEPLOY_* org secrets.
 
@@ -220,6 +278,12 @@ def _create_private_repo(repo: str, target: Path) -> Path:
       - Adds the repo to repos.yml so future tasks can access it
       - Writes a .jarvis-prospect marker file (identifies it as a prospect site)
       - Enrols the repo in the JARVIS_DEPLOY_* org secrets (soft-fail)
+
+    Atomicity: if any step after the local clone fails (rewrite origin,
+    commit, seed-push…), the half-bootstrapped workspace is nuked before
+    re-raising. Otherwise the next retry would hit `_git_clone_or_fetch`
+    with a local `main` and no `origin/main`, leaving the task permanently
+    stuck at "git reset --hard origin/main".
     """
     from .repos import add_to_whitelist
 
@@ -234,37 +298,49 @@ def _create_private_repo(repo: str, target: Path) -> Path:
         "--description", "Created by Jarvis local agent",
     ], cwd=str(target.parent))
 
-    # `gh repo create --clone` sets origin to a credential-less HTTPS
-    # URL; the subsequent `git push` then dies with exit 128 because
-    # the credential helper inside the container isn't wired up. Flip
-    # origin to the same HTTPS-with-PAT form used by the regular
-    # clone/fetch path so push works without leaning on gh's keychain.
     try:
-        _sh(["git", "remote", "set-url", "origin", _origin_url(repo)], cwd=target)
-    except subprocess.CalledProcessError:
-        log.warning("could not rewrite origin URL after gh repo create — push may fail")
+        # `gh repo create --clone` sets origin to a credential-less HTTPS
+        # URL; the subsequent `git push` then dies with exit 128 because
+        # the credential helper inside the container isn't wired up. Flip
+        # origin to the same HTTPS-with-PAT form used by the regular
+        # clone/fetch path so push works without leaning on gh's keychain.
+        try:
+            _sh(["git", "remote", "set-url", "origin", _origin_url(repo)], cwd=target)
+        except subprocess.CalledProcessError:
+            log.warning("could not rewrite origin URL after gh repo create — push may fail")
 
-    # Set git identity for all commits in this repo
-    _sh(["git", "config", "user.email", "contact@codedvisiondesign.co.uk"], cwd=target)
-    _sh(["git", "config", "user.name", "Coded Vision Design"], cwd=target)
+        # Set git identity for all commits in this repo
+        _sh(["git", "config", "user.email", "contact@codedvisiondesign.co.uk"], cwd=target)
+        _sh(["git", "config", "user.name", "Coded Vision Design"], cwd=target)
 
-    # Seed with README + .jarvis-prospect marker
-    readme = target / "README.md"
-    readme.write_text(
-        f"# {repo}\n\nCreated by Jarvis local agent. "
-        f"Will deploy automatically to https://{repo.lower().replace('_', '-')}.codedvisiondesign.co.uk after the next successful task.\n",
-        encoding="utf-8",
-    )
-    (target / ".jarvis-prospect").write_text(
-        "# Marker file - identifies this repo as a Jarvis-built prospect site.\n"
-        "# Determines which org secrets and deploy targets apply.\n"
-        "# Do not delete unless converting this repo to a client/production repo.\n",
-        encoding="utf-8",
-    )
+        # Seed with README + .jarvis-prospect marker
+        readme = target / "README.md"
+        readme.write_text(
+            f"# {repo}\n\nCreated by Jarvis local agent. "
+            f"Will deploy automatically to https://{repo.lower().replace('_', '-')}.codedvisiondesign.co.uk after the next successful task.\n",
+            encoding="utf-8",
+        )
+        (target / ".jarvis-prospect").write_text(
+            "# Marker file - identifies this repo as a Jarvis-built prospect site.\n"
+            "# Determines which org secrets and deploy targets apply.\n"
+            "# Do not delete unless converting this repo to a client/production repo.\n",
+            encoding="utf-8",
+        )
 
-    _sh(["git", "add", "README.md", ".jarvis-prospect"], cwd=target)
-    _sh(["git", "commit", "-m", "chore: initial repo setup by Jarvis"], cwd=target)
-    _sh(["git", "push", "-u", "origin", "main"], cwd=target)
+        _sh(["git", "add", "README.md", ".jarvis-prospect"], cwd=target)
+        _sh(["git", "commit", "-m", "chore: initial repo setup by Jarvis"], cwd=target)
+        _sh(["git", "push", "-u", "origin", "main"], cwd=target)
+    except Exception:
+        # Half-bootstrapped workspace would trap every future retry in the
+        # "local main exists, origin/main missing" hole. Nuke it so the
+        # next call to `_git_clone_or_fetch` starts from a clean slate
+        # (the GitHub repo itself stays — `gh repo create` is idempotent
+        # against "name already exists" and the empty-remote self-heal in
+        # `_git_clone_or_fetch` handles the rest).
+        log.warning("private repo bootstrap failed for %s — nuking workspace", repo)
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        raise
 
     # Register so future tasks can run against it
     add_to_whitelist(repo)
@@ -294,14 +370,65 @@ def _origin_url(repo: str) -> str:
     return f"git@github.com:{GITHUB_ORG}/{repo}.git"
 
 
-def _git_clone_or_fetch(repo: str, create_if_missing: bool = False) -> Path:
-    """Ensure the workspace exists and is on origin/main. Returns the path.
+def _remote_default_branch(workspace: Path) -> str | None:
+    """Resolve the remote default branch from origin/HEAD or refs/remotes/origin/*.
 
-    Self-heal: if the fetch/clone fails with exit 128 (typically a
-    stale auth setup, deleted remote branch, or moved origin URL),
-    nuke the workspace and re-clone from scratch. Exit 128 is the
-    signal we use; finer-grained classification lives in
-    `_interpret_error`.
+    Returns the bare branch name (e.g. "main"), or None when the remote
+    advertises no branches at all (empty repo).
+    """
+    # Preferred: origin/HEAD symref tells us exactly what the remote default is.
+    r = _sh(
+        ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        cwd=workspace,
+        check=False,
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        # symref looks like "origin/main"
+        return r.stdout.strip().split("/", 1)[-1]
+
+    # Fallback: ask git to (re)resolve HEAD from the remote.
+    r = _sh(["git", "remote", "set-head", "origin", "--auto"], cwd=workspace, check=False)
+    if r.returncode == 0:
+        r2 = _sh(
+            ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            cwd=workspace,
+            check=False,
+        )
+        if r2.returncode == 0 and r2.stdout.strip():
+            return r2.stdout.strip().split("/", 1)[-1]
+
+    # Last resort: scan local remote-tracking refs and prefer main > master > first.
+    r = _sh(
+        ["git", "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin/"],
+        cwd=workspace,
+        check=False,
+    )
+    refs = [
+        line.split("/", 1)[-1]
+        for line in (r.stdout or "").splitlines()
+        if line and not line.endswith("/HEAD")
+    ]
+    if "main" in refs:
+        return "main"
+    if "master" in refs:
+        return "master"
+    return refs[0] if refs else None
+
+
+def _git_clone_or_fetch(repo: str, create_if_missing: bool = False) -> Path:
+    """Ensure the workspace exists and is on the remote's default branch.
+
+    Self-heal layers (in order of cheapness):
+      1. Fetch exit 128 → nuke + re-clone (stale auth / moved remote).
+      2. Empty remote (zero refs after fetch) + local commits on main →
+         seed the remote with `git push -u origin main`. This recovers from
+         a previous `_create_private_repo` run that died after the local
+         commit but before the push landed (e.g. the old token had no
+         write scope on the freshly-created repo).
+      3. Empty remote + nothing local → nuke + re-clone (and let the
+         caller's create_if_missing path re-run repo creation if needed).
+      4. Reset to origin/<default> fails → nuke + re-clone rather than
+         dying with the cryptic "pathspec 'master' did not match" message.
     """
     target = settings.workspace_root / "workspaces" / repo
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -348,14 +475,47 @@ def _git_clone_or_fetch(repo: str, create_if_missing: bool = False) -> Path:
             return _fresh_clone()
         raise
 
-    # Hard-reset main to origin/main so we always start fresh.
-    # If there's no main, try master.
+    default_branch = _remote_default_branch(target)
+
+    if default_branch is None:
+        # Empty remote. This happens when `_create_private_repo` made the
+        # repo on GitHub but the seed push never landed (e.g. previous run
+        # raced a token-without-write-scope and bailed mid-flight).
+        local_head = _sh(["git", "rev-parse", "--verify", "HEAD"], cwd=target, check=False)
+        if local_head.returncode == 0:
+            # We have local commits — push them up to seed the remote.
+            current = _sh(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=target, check=False
+            ).stdout.strip() or "main"
+            log.warning(
+                "remote %s has no branches — seeding with local %s", repo, current
+            )
+            try:
+                _sh(["git", "push", "-u", "origin", current], cwd=target)
+                return target
+            except subprocess.CalledProcessError as exc:
+                log.warning(
+                    "seed push to %s failed (%s) — re-cloning from scratch",
+                    repo, (exc.stderr or "")[:240],
+                )
+                return _fresh_clone()
+        # No local commits either: nuke and let the create-if-missing
+        # branch (if enabled) re-bootstrap the repo cleanly.
+        log.warning("remote %s is empty and local has no commits — re-cloning", repo)
+        return _fresh_clone()
+
+    # Hard-reset to the resolved remote default branch so every task
+    # starts from a known-clean state.
     try:
-        _sh(["git", "checkout", "main"], cwd=target)
-        _sh(["git", "reset", "--hard", "origin/main"], cwd=target)
-    except subprocess.CalledProcessError:
-        _sh(["git", "checkout", "master"], cwd=target)
-        _sh(["git", "reset", "--hard", "origin/master"], cwd=target)
+        _sh(["git", "checkout", default_branch], cwd=target)
+        _sh(["git", "reset", "--hard", f"origin/{default_branch}"], cwd=target)
+    except subprocess.CalledProcessError as exc:
+        log.warning(
+            "could not align %s with origin/%s (%s) — re-cloning from scratch",
+            target, default_branch, (exc.stderr or "")[:240],
+        )
+        return _fresh_clone()
+
     return target
 
 
@@ -1147,37 +1307,111 @@ async def run_job(task: dict[str, Any]) -> None:
                 "exception": str(e),
                 "exception_type": exc_kind,
             })
-        # Phase 19 blocked-note (exception path). Best-effort; if note
-        # generation itself fails too we still flip status + alert.
-        # NOTE: write_handover is a nested closure defined inside the try
-        # block, so it's UnboundLocal here if the exception fired before
-        # that point (e.g. clone or scaffold crashed). Call emit_handover_note
-        # directly to dodge the binding issue.
-        try:
-            note_artefacts: dict[str, Any] = {
-                "exception": str(e)[:400],
-                "exception_type": exc_kind,
-            }
-            if interpretation is not None:
-                note_artefacts["diagnosis"] = interpretation[0]
-                note_artefacts["recommended_action"] = interpretation[1]
-            await emit_handover_note(
-                client, task, "blocked", backend_name,
-                context={"user_steer": metadata.get("last_user_steer", "")},
-                artefacts=note_artefacts,
+        # ── Hive failover ────────────────────────────────────────────
+        # Before we mark this task properly blocked, decide whether
+        # another worker should get a swing. Infrastructure errors
+        # (git, gh, network) usually mean *this* worker is the broken
+        # one, not the task. Self-exclude and re-queue so the next poll
+        # by a healthy worker picks it up.
+        rotated = False
+        if _is_retryable_infra_error(e):
+            try:
+                # Re-read metadata fresh from the original claim payload;
+                # mutating in place is fine because we don't need it again.
+                existing_excluded = metadata.get("excluded_agents")
+                if isinstance(existing_excluded, list):
+                    excluded = [str(x) for x in existing_excluded if x]
+                else:
+                    excluded = []
+                me = agent_id()
+                retry_count = int(metadata.get("hive_retry_count") or 0)
+                # Count the *unique* workers that have failed so far. We
+                # rotate while there's still room under the cap AND we
+                # haven't already excluded the current worker (which
+                # would mean the claim filter is broken — bail to blocked
+                # rather than spin forever).
+                if me not in excluded and retry_count < HIVE_RETRY_MAX:
+                    excluded.append(me)
+                    rotation_reason = (
+                        interpretation[0] if interpretation is not None
+                        else f"{exc_kind}: {exc_msg[:200]}"
+                    )
+                    await client.merge_metadata(task_id, {
+                        "excluded_agents": excluded,
+                        "hive_retry_count": retry_count + 1,
+                        "last_hive_rotation": {
+                            "agent_id": me,
+                            "reason": rotation_reason,
+                            "exception_type": exc_kind,
+                            "at": time.time(),
+                        },
+                    })
+                    await client.append_run(task_id, "jarvis_note", {
+                        "message": (
+                            f"🔁 Infrastructure error on worker `{me}` "
+                            f"({rotation_reason[:160]}). Rotating to another "
+                            f"hive worker (attempt {retry_count + 1}/"
+                            f"{HIVE_RETRY_MAX})."
+                        ),
+                        "rotation": {
+                            "from_agent": me,
+                            "attempt": retry_count + 1,
+                            "max_attempts": HIVE_RETRY_MAX,
+                        },
+                    })
+                    await client.set_status(task_id, "queued")
+                    await post_as_jarvis(
+                        f"🔁 Task #{task_id} rotated off `{me}` "
+                        f"({exc_kind}). Another hive worker will pick it up."
+                    )
+                    rotated = True
+                    log.info(
+                        "task %s rotated off %s (attempt %d/%d): %s",
+                        task_id, me, retry_count + 1, HIVE_RETRY_MAX, rotation_reason,
+                    )
+            except Exception:
+                log.exception("hive rotation failed; falling through to blocked")
+
+        if not rotated:
+            # Phase 19 blocked-note (exception path). Best-effort; if note
+            # generation itself fails too we still flip status + alert.
+            try:
+                note_artefacts: dict[str, Any] = {
+                    "exception": str(e)[:400],
+                    "exception_type": exc_kind,
+                }
+                if interpretation is not None:
+                    note_artefacts["diagnosis"] = interpretation[0]
+                    note_artefacts["recommended_action"] = interpretation[1]
+                # Surface the hive history so the operator can see we tried.
+                if metadata.get("excluded_agents"):
+                    note_artefacts["hive_excluded_agents"] = metadata["excluded_agents"]
+                    note_artefacts["hive_retry_count"] = int(
+                        metadata.get("hive_retry_count") or 0
+                    )
+                await emit_handover_note(
+                    client, task, "blocked", backend_name,
+                    context={"user_steer": metadata.get("last_user_steer", "")},
+                    artefacts=note_artefacts,
+                )
+            except Exception:
+                log.exception("blocked-note emit failed during exception handler")
+            await client.set_status(task_id, "blocked")
+            # Discord alert — prefer the diagnosis when available.
+            alert_summary = (
+                f"`{interpretation[0]}`\n→ {interpretation[1]}"
+                if interpretation is not None
+                else f"`{exc_kind}: {str(e)[:200]}`"
             )
-        except Exception:
-            log.exception("blocked-note emit failed during exception handler")
-        await client.set_status(task_id, "blocked")
-        # Discord alert — prefer the diagnosis when available.
-        alert_summary = (
-            f"`{interpretation[0]}`\n→ {interpretation[1]}"
-            if interpretation is not None
-            else f"`{exc_kind}: {str(e)[:200]}`"
-        )
-        await post_as_jarvis(
-            f"💥 Task #{task_id} crashed in the local agent: {alert_summary}"
-        )
+            hive_tail = ""
+            if metadata.get("hive_retry_count"):
+                hive_tail = (
+                    f"\n_Hive: {metadata['hive_retry_count']} worker(s) tried "
+                    f"and failed before giving up._"
+                )
+            await post_as_jarvis(
+                f"💥 Task #{task_id} crashed in the local agent: {alert_summary}{hive_tail}"
+            )
     finally:
         stop_hb.set()
         await hb_task
