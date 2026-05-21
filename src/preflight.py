@@ -82,10 +82,29 @@ async def fetch_prior_context(
             seen_ids.add(nid)
             deduped_patterns.append(n)
 
-    if not deduped_recent and not deduped_patterns:
+    knowledge = ""
+    try:
+        knowledge = await client.fetch_knowledge_context(
+            title=title,
+            body=body,
+            entity=entity or None,
+        )
+    except Exception as exc:
+        log.warning("fetch_knowledge_context failed: %s", exc)
+
+    if not deduped_recent and not deduped_patterns and not knowledge:
         return ""
 
-    return _render_block(entity, deduped_recent, deduped_patterns)
+    notes_block = ""
+    if deduped_recent or deduped_patterns:
+        notes_block = _render_block(entity, deduped_recent, deduped_patterns)
+
+    parts: list[str] = []
+    if knowledge:
+        parts.append(knowledge)
+    if notes_block:
+        parts.append(notes_block)
+    return "\n\n".join(parts).strip()
 
 
 def _build_search_query(title: str, body: str) -> str:

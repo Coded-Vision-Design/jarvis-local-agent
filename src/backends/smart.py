@@ -33,6 +33,23 @@ from .qwen import QwenBackend
 
 log = logging.getLogger("jarvis-agent.backend.smart")
 
+
+def _can_use_claude() -> bool:
+    """Claude Code is routable when the worker has the CLI and either
+    subscription OAuth (always tried with API key stripped) or an API key
+    for overflow. Subscription-only hosts must not be gated on API key."""
+    from ..agent_identity import detect_capabilities
+
+    caps = set(detect_capabilities())
+    if "claude" not in caps:
+        return False
+    if settings.anthropic_api_key:
+        return True
+    # Capability implies claude binary + login on this host; subscription path
+    # does not require ANTHROPIC_API_KEY in env.
+    return True
+
+
 # ── Role detection keywords (lowercase, single-pass match) ────────────────────
 
 # Worker tier: tasks Qwen should own. Cheap, fast, repetitive, no-think.
@@ -195,7 +212,7 @@ class SmartBackend(Backend):
 
         # ── Architect tier: Claude (Opus-class), fallback Codex, then Qwen ──
         if tier == "architect":
-            if settings.anthropic_api_key:
+            if _can_use_claude():
                 await log_cb("jarvis_note", {"message": "smart-router: routing to claude (architect tier)"})
                 try:
                     result = await ClaudeBackend().run(task, workspace, log_cb, inject_queue)
@@ -220,7 +237,7 @@ class SmartBackend(Backend):
 
         # ── Standard tier: Claude (Sonnet-class), fallback Codex, then Qwen ─
         if tier == "standard":
-            if settings.anthropic_api_key:
+            if _can_use_claude():
                 await log_cb("jarvis_note", {"message": "smart-router: routing to claude (standard tier)"})
                 try:
                     result = await ClaudeBackend().run(task, workspace, log_cb, inject_queue)
@@ -277,7 +294,7 @@ class SmartBackend(Backend):
                 })
             # No-GPU workers go to Claude (creative writing on Sonnet is
             # fine — better than a free-tier text model anyway).
-            if "qwen" not in caps and settings.anthropic_api_key:
+            if "qwen" not in caps and _can_use_claude():
                 await log_cb("jarvis_note", {"message": "smart-router: creative on claude (no qwen/hermes)"})
                 return await ClaudeBackend().run(task, workspace, log_cb, inject_queue)
             return await self._run_qwen_with_label(task, workspace, log_cb, inject_queue,

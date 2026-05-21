@@ -20,7 +20,11 @@ class Settings(BaseSettings):
     discord_jarvis_tasks_webhook_url: str = ""
 
     poll_interval_seconds: int = 5
+    # Idle/default; during an active job _heartbeat_loop uses
+    # heartbeat_active_interval_seconds so the 90s reaper window
+    # is not hit on long Claude runs.
     heartbeat_interval_seconds: int = 30
+    heartbeat_active_interval_seconds: int = 15
 
     # Phase 22 — WebSocket gateway for cloud->agent task push.
     # When set, the agent opens a persistent WS to this URL and

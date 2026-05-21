@@ -30,6 +30,11 @@ from .notes import emit_handover_note
 from .preflight import fetch_prior_context
 from .repos import is_whitelisted
 from .state import bus, inject_queues, slots
+from .task_terminal import (
+    append_task_log,
+    setup_task_terminal,
+    teardown_task_terminal,
+)
 
 log = logging.getLogger("jarvis-agent.runner")
 
@@ -46,6 +51,32 @@ MAX_HEAL_ATTEMPTS = 3             # max self-healing retry cycles per task
 # (claude exited, tests failed, etc.) still go straight to blocked —
 # rotating won't help when the work itself is busted.
 HIVE_RETRY_MAX = 3
+
+
+async def _record_deliverable_links(
+    client: Any,
+    task_id: int,
+    repo: str,
+    *,
+    branch: str | None = None,
+    pr_url: str | None = None,
+    deploy_url: str | None = None,
+    no_changes: bool | None = None,
+) -> None:
+    """Persist repo / PR / deploy URLs on the task so the Jarvis drawer can link them."""
+    patch: dict[str, Any] = {
+        "local_agent_repo": repo,
+        "local_agent_repo_url": f"https://github.com/{GITHUB_ORG}/{repo}",
+    }
+    if branch:
+        patch["local_agent_branch"] = branch
+    if pr_url:
+        patch["local_agent_pr_url"] = pr_url
+    if deploy_url:
+        patch["local_agent_deploy_url"] = deploy_url
+    if no_changes is not None:
+        patch["local_agent_no_changes"] = no_changes
+    await client.merge_metadata(task_id, patch)
 
 
 def error_run_payload(
@@ -601,6 +632,23 @@ def _has_uncommitted_changes(workspace: Path) -> bool:
     return bool(r.stdout.strip())
 
 
+def _head_commit_shas(workspace: Path, limit: int = 8) -> list[str]:
+    """Recent commit SHAs on the current branch — fed into handover artefacts."""
+    try:
+        r = subprocess.run(
+            ["git", "log", "-n", str(limit), "--format=%H"],
+            cwd=str(workspace),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            return []
+        return [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+    except Exception:
+        return []
+
+
 def _commit_and_push(workspace: Path, branch: str, summary: str) -> None:
     _sh(["git", "add", "-A"], cwd=workspace)
     _sh(
@@ -907,7 +955,7 @@ def _update_readme_with_url(workspace: Path, url: str) -> None:
 
 
 async def _heartbeat_loop(task_id: int, stop: asyncio.Event) -> None:
-    interval = settings.heartbeat_interval_seconds
+    interval = settings.heartbeat_active_interval_seconds
     client = get_client()
     while not stop.is_set():
         try:
@@ -937,6 +985,9 @@ async def run_job(task: dict[str, Any]) -> None:
             "message": f"agent {agent_id()} skipping task: {reason}",
         })
         # Push back to queued so a capable agent can claim it
+        await client.merge_metadata(task_id, {
+            "claim_hold_until": time.time() + 30,
+        })
         await client.set_status(task_id, "queued")
         return
 
@@ -1019,6 +1070,9 @@ async def run_job(task: dict[str, Any]) -> None:
             task_id, "jarvis_note",
             {"message": f"{backend_name} slot busy; requeuing"},
         )
+        await client.merge_metadata(task_id, {
+            "claim_hold_until": time.time() + 45,
+        })
         await client.set_status(task_id, "queued")
         return
 
@@ -1029,6 +1083,12 @@ async def run_job(task: dict[str, Any]) -> None:
         "title": task.get("title", ""),
     })
     inject_queues[task_id] = asyncio.Queue(maxsize=10)
+
+    try:
+        term_meta = setup_task_terminal(task_id)
+        await client.merge_metadata(task_id, term_meta)
+    except Exception:
+        log.exception("task %s terminal setup failed", task_id)
 
     stop_hb = asyncio.Event()
     hb_task = asyncio.create_task(_heartbeat_loop(task_id, stop_hb))
@@ -1049,6 +1109,7 @@ async def run_job(task: dict[str, Any]) -> None:
                 _git_clone_or_fetch, str(repo), create_repo
             )
             branch = await asyncio.to_thread(_make_branch, workspace, title_slug)
+            await _record_deliverable_links(client, task_id, str(repo), branch=branch)
             await client.append_run(task_id, "jarvis_note", {
                 "message": f"working in {workspace} on branch {branch}",
             })
@@ -1092,6 +1153,24 @@ async def run_job(task: dict[str, Any]) -> None:
                     f"{task_with_standards}"
                 )
 
+            from .stack_policy import (
+                contract_from_metadata,
+                format_stack_prompt_block,
+                should_validate_stack,
+                validate_workspace_against_contract,
+            )
+            stack_contract = contract_from_metadata(metadata)
+            if stack_contract:
+                task_with_standards = (
+                    f"{format_stack_prompt_block(stack_contract)}{task_with_standards}"
+                )
+                await client.append_run(task_id, "jarvis_note", {
+                    "message": (
+                        f"stack contract: {stack_contract.get('profile_id')} "
+                        f"({stack_contract.get('label', '')})"
+                    ),
+                })
+
             # Phase 19 — track tool calls + errors for the auto-note
             # context. Capped to recent N so the note prompt stays small.
             recent_tools: list[str] = []
@@ -1101,6 +1180,10 @@ async def run_job(task: dict[str, Any]) -> None:
             async def log_cb(kind: str, payload: dict) -> None:
                 await client.append_run(task_id, kind, payload)
                 await bus.put_event(task_id, kind, payload)
+                if kind == "terminal_line":
+                    line = payload.get("line")
+                    if isinstance(line, str):
+                        append_task_log(task_id, line)
                 # Phase 19 — track for the note context + fire the
                 # tool_error trigger on the 2nd consecutive failure
                 # of the same tool (one-off transients don't qualify).
@@ -1230,14 +1313,80 @@ async def run_job(task: dict[str, Any]) -> None:
                 return
 
             changed = await asyncio.to_thread(_has_uncommitted_changes, workspace)
+            if changed and stack_contract and should_validate_stack(task, metadata):
+                stack_ok, stack_failures = await asyncio.to_thread(
+                    validate_workspace_against_contract, workspace, stack_contract,
+                )
+                if not stack_ok:
+                    await client.append_run(
+                        task_id,
+                        "error",
+                        error_run_payload(
+                            reason="stack_mismatch",
+                            message="Workspace does not match the resolved stack contract.",
+                            error="; ".join(stack_failures)[:2000],
+                            failures=stack_failures,
+                            profile_id=stack_contract.get("profile_id"),
+                        ),
+                    )
+                    await write_handover("blocked", artefacts={
+                        "stack_profile": stack_contract.get("profile_id"),
+                        "validation_errors": stack_failures,
+                    })
+                    await client.set_status(task_id, "blocked")
+                    await post_as_jarvis(
+                        f"⚠️ Task #{task_id} blocked — stack mismatch "
+                        f"({stack_contract.get('profile_id')}): "
+                        f"{stack_failures[0][:200]}"
+                    )
+                    return
+
             if not changed:
-                await client.append_run(task_id, "jarvis_note", {
-                    "message": "sub-agent finished with no file changes",
-                })
+                from .task_evidence import no_changes_should_block
+
+                should_block, block_reason = no_changes_should_block(
+                    task, backend_name=backend_name,
+                )
+                await _record_deliverable_links(
+                    client, task_id, str(repo), branch=branch, no_changes=True,
+                )
                 elapsed = int(time.time() - started)
-                # Phase 19 — done-note even on the no-changes path so
-                # the engineer log captures "ran, decided nothing to
-                # do, reasoned why".
+                if should_block:
+                    msg = (
+                        "Sub-agent finished with no file changes on a task that "
+                        "requires shipped code (PR, commits, or deploy). "
+                        "Re-steer the task body or set metadata.allow_no_changes "
+                        "for doc-only work."
+                    )
+                    if block_reason == "codex_advisory_no_files":
+                        msg = (
+                            "Codex ran in advisory mode and did not write files. "
+                            "Use backend claude or qwen for implementation tasks."
+                        )
+                    await client.append_run(
+                        task_id,
+                        "error",
+                        error_run_payload(
+                            reason=block_reason,
+                            message=msg,
+                        ),
+                    )
+                    await write_handover("blocked", artefacts={
+                        "time_spent_seconds": elapsed,
+                        "no_changes": True,
+                        "spent_pence": result.spent_pence,
+                        "block_reason": block_reason,
+                    })
+                    await client.set_status(task_id, "blocked")
+                    await post_as_jarvis(
+                        f"⚠️ Task #{task_id} ({backend_name}, `{repo}`) blocked — "
+                        f"no shipped artefact ({block_reason}). _{elapsed}s_"
+                    )
+                    return
+
+                await client.append_run(task_id, "jarvis_note", {
+                    "message": "sub-agent finished with no file changes (allowed for this task)",
+                })
                 await write_handover("done", artefacts={
                     "time_spent_seconds": elapsed,
                     "no_changes": True,
@@ -1267,11 +1416,10 @@ async def run_job(task: dict[str, Any]) -> None:
                 _open_pr, workspace, commit_msg, "\n".join(pr_body_parts)
             )
 
-            if pr_url:
-                await client.merge_metadata(task_id, {
-                    "local_agent_pr_url": pr_url,
-                    "local_agent_branch": branch,
-                })
+            await _record_deliverable_links(
+                client, task_id, str(repo), branch=branch, pr_url=pr_url or None,
+                no_changes=False,
+            )
 
             # ── Deploy to VPS subdomain if it looks like a web project ──────
             deploy_url: str | None = None
@@ -1311,9 +1459,15 @@ async def run_job(task: dict[str, Any]) -> None:
                         except Exception:
                             log.exception("failed to commit README deploy URL")
 
-                        await client.merge_metadata(task_id, {
-                            "local_agent_deploy_url": deploy_url,
-                        })
+                        await _record_deliverable_links(
+                            client,
+                            task_id,
+                            str(repo),
+                            branch=branch,
+                            pr_url=pr_url or None,
+                            deploy_url=deploy_url,
+                            no_changes=False,
+                        )
                         await client.append_run(task_id, "jarvis_note", {
                             "message": f"deployed to {deploy_url}",
                         })
@@ -1332,6 +1486,7 @@ async def run_job(task: dict[str, Any]) -> None:
                     })
 
             elapsed = int(time.time() - started)
+            commit_shas = await asyncio.to_thread(_head_commit_shas, workspace)
             # Phase 19 done-note (success path) — captures the
             # artefacts (PR URL, branch, deploy URL, time spent) and
             # asks the backend for a structured engineer summary.
@@ -1339,6 +1494,7 @@ async def run_job(task: dict[str, Any]) -> None:
                 "pr_url": pr_url,
                 "branch": branch,
                 "deploy_url": deploy_url,
+                "commits": commit_shas,
                 "time_spent_seconds": elapsed,
                 "spent_pence": result.spent_pence,
             })
@@ -1510,3 +1666,7 @@ async def run_job(task: dict[str, Any]) -> None:
         await hb_task
         bus.task_ended(task_id)
         inject_queues.pop(task_id, None)
+        try:
+            teardown_task_terminal(task_id)
+        except Exception:
+            log.exception("task %s terminal teardown failed", task_id)

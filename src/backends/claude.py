@@ -1,6 +1,6 @@
-"""Claude Code headless backend. Mounts the user's ~/.claude read-only so
-MEMORY.md and skill library come along for the ride. Uses --bare to avoid
-loading the host's MCP settings.json (those reference Windows paths)."""
+"""Claude Code headless backend. Mounts the user's ~/.claude so MEMORY.md,
+skills/, and CLAUDE.md apply. Headless `claude -p` runs in the task workspace
+(subscription-first, API overflow on rate-limit unless forced)."""
 from __future__ import annotations
 
 import asyncio
@@ -179,7 +179,8 @@ class ClaudeBackend(Backend):
                 if usage:
                     spent_tokens_total += int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0))
             except Exception:
-                pass
+                # Non-JSON lines still appear in the task terminal iframe.
+                await log_cb("terminal_line", {"line": line[:2000]})
 
         rc = await proc.wait()
 

@@ -136,6 +136,34 @@ class JarvisClient:
         except Exception:
             return []
 
+    async def fetch_knowledge_context(
+        self,
+        *,
+        title: str,
+        body: str,
+        entity: str | None = None,
+        limit: int = 4,
+    ) -> str:
+        """Tier 3 pre-work: Jarvis knowledge bank (RAG chunks) for this task."""
+        query = f"{title}\n{body[:1500]}".strip()
+        if not query:
+            return ""
+        params: dict[str, Any] = {"q": query, "limit": limit}
+        if entity:
+            params["entity"] = entity
+        r = await self._http.get("/api/knowledge/context/agent", params=params)
+        if r.status_code >= 400:
+            log.warning(
+                "fetch_knowledge_context failed: %s %s",
+                r.status_code,
+                r.text[:200],
+            )
+            return ""
+        try:
+            return (r.json().get("block") or "").strip()
+        except Exception:
+            return ""
+
     async def search_notes(
         self,
         q: str = "",
