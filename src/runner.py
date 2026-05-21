@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from .agent_identity import can_run, agent_id
-from .backends import get_backend
+from .backends import BackendResult, get_backend
 from .config import settings
 from .discord_webhook import post_as_jarvis
 from .jarvis_client import get_client
@@ -39,7 +39,15 @@ from .task_terminal import (
 log = logging.getLogger("jarvis-agent.runner")
 
 GITHUB_ORG = "Coded-Vision-Design"  # canonical org slug; GitHub is case-insensitive but `gh repo create` and the SSH path need exact match
-MAX_HEAL_ATTEMPTS = 3             # max self-healing retry cycles per task
+MAX_HEAL_ATTEMPTS = 3             # max self-healing retry cycles per task (TEST failures)
+MAX_BACKEND_RETRIES = 1           # same-backend retry budget on backend failure
+BACKEND_RETRY_MIN_DELAY_S = 30    # backoff before any retry — let transient causes clear
+BACKEND_RETRY_TOKEN_CEILING = 100_000  # refuse retry if cumulative spent_tokens exceeds this
+# Default fallback chain when the initial backend fails terminally.
+# Order: most capable first, then alternatives. Truncated at the
+# initial backend so we don't fall back to a "weaker" tool when the
+# user explicitly asked for a stronger one.
+DEFAULT_BACKEND_CHAIN: list[str] = ["claude", "codex", "qwen"]
 
 # ── Hive failover ────────────────────────────────────────────────────
 # When a worker hits an infrastructure-level error (git, gh, network),
@@ -301,6 +309,34 @@ def _is_retryable_infra_error(exc: Exception) -> bool:
         "permission denied",
     )
     return any(sig in haystack for sig in network_signals)
+
+
+def _resolve_backend_chain(
+    initial: str,
+    metadata: dict[str, Any] | None,
+) -> list[str]:
+    """Return the ordered list of backends to try for this task.
+
+    Rules:
+      - metadata.required_backend (string) overrides everything → [that].
+        Use this to pin a task to one tool with no fallback.
+      - metadata.allow_backend_fallback == False → [initial] only.
+      - Otherwise: start at `initial` and append the rest of
+        DEFAULT_BACKEND_CHAIN after it. e.g. claude → [claude, codex, qwen];
+        codex → [codex, qwen]. We never fall back to a "weaker" tool
+        when the operator picked a stronger one upfront.
+      - An unknown initial backend yields [initial] only (no chain).
+    """
+    md = metadata or {}
+    required = md.get("required_backend")
+    if isinstance(required, str) and required:
+        return [required]
+    if md.get("allow_backend_fallback") is False:
+        return [initial]
+    if initial in DEFAULT_BACKEND_CHAIN:
+        idx = DEFAULT_BACKEND_CHAIN.index(initial)
+        return DEFAULT_BACKEND_CHAIN[idx:]
+    return [initial]
 
 
 def _grant_deploy_secret_access(repo: str) -> bool:
@@ -1337,7 +1373,13 @@ async def run_job(task: dict[str, Any]) -> None:
                     "message": "seeded CLAUDE.md with mandatory website rules",
                 })
 
-            # 2. Run backend
+            # 2. Run backend (with retry + cross-backend fallback chain).
+            # The classifier in heal_prompts.py decides whether a failed
+            # attempt is worth retrying; the chain in _resolve_backend_chain
+            # decides which tool to try next when same-backend retries are
+            # exhausted. Anti-thrash: 30s minimum backoff, 100K cumulative
+            # token ceiling, and rate-limited/auth-error classes don't retry.
+            backend_chain = _resolve_backend_chain(backend_name, metadata)
             backend = get_backend(backend_name)
 
             # Phase 19: pre-work retrieval. Pull prior handover notes
@@ -1475,8 +1517,117 @@ async def run_job(task: dict[str, Any]) -> None:
                     artefacts=artefacts or {},
                 )
 
-            result = await backend.run(task_with_standards, workspace, log_cb,
-                                       inject_queue=inject_queues.get(task_id))
+            # Backend chain loop. Try each backend in `backend_chain`,
+            # with up to MAX_BACKEND_RETRIES same-backend retries on
+            # retryable failure classes. Cross-backend fallback fires
+            # when same-backend retries are exhausted. Telemetry written
+            # for every attempt so the operator can see the chain unfold
+            # in the activity log.
+            from .heal_prompts import (
+                CROSS_BACKEND_STEER_TEMPLATE,
+                RETRY_STEER,
+                classify_failure,
+                is_retryable,
+            )
+            result: BackendResult | None = None
+            total_tokens_spent = 0
+            base_prompt = task_with_standards
+            last_failure_summary = ""
+            for backend_idx, backend_id in enumerate(backend_chain):
+                if backend_id != backend_name:
+                    # Cross-backend switch — refresh the resolver target
+                    # so log_cb attributes events to the right tool.
+                    backend = get_backend(backend_id)
+                    backend_name = backend_id
+                    # Prepend the cross-backend steer ONCE per switch,
+                    # not on subsequent same-backend retries.
+                    cross_steer = CROSS_BACKEND_STEER_TEMPLATE.format(
+                        prev_backend=backend_chain[backend_idx - 1],
+                        prev_class=classify_failure(
+                            result.summary if result else None,
+                            result.error if result else None,
+                            rate_limited=False,
+                        ) if result else "unknown",
+                        prev_summary=last_failure_summary[:200],
+                    )
+                    prompt_for_backend = f"<cross_backend_steer>\n{cross_steer}\n</cross_backend_steer>\n\n{base_prompt}"
+                    await client.append_run(task_id, "jarvis_note", {
+                        "message": (
+                            f"backend fallback: switching to {backend_id} after "
+                            f"{backend_chain[backend_idx - 1]} exhausted"
+                        ),
+                        "kind": "backend_fallback",
+                        "from_backend": backend_chain[backend_idx - 1],
+                        "to_backend": backend_id,
+                    })
+                else:
+                    prompt_for_backend = base_prompt
+
+                for retry_idx in range(MAX_BACKEND_RETRIES + 1):
+                    # Token-budget guard: cumulative across all backends.
+                    if total_tokens_spent > BACKEND_RETRY_TOKEN_CEILING:
+                        await client.append_run(task_id, "jarvis_note", {
+                            "message": (
+                                f"backend retry skipped — token ceiling "
+                                f"{BACKEND_RETRY_TOKEN_CEILING} exceeded "
+                                f"(cumulative {total_tokens_spent})"
+                            ),
+                            "kind": "backend_retry_budget_exhausted",
+                        })
+                        break
+
+                    if retry_idx > 0:
+                        # Backoff + classification-aware steer prepend.
+                        await asyncio.sleep(BACKEND_RETRY_MIN_DELAY_S)
+                        prev_class = classify_failure(
+                            result.summary if result else None,
+                            result.error if result else None,
+                        )
+                        steer = RETRY_STEER.get(prev_class, RETRY_STEER["unknown"])
+                        retry_prompt = (
+                            f"<retry_steer attempt=\"{retry_idx + 1}\" "
+                            f"prev_class=\"{prev_class}\">\n{steer}\n</retry_steer>\n\n"
+                            f"{prompt_for_backend}"
+                        )
+                    else:
+                        retry_prompt = prompt_for_backend
+
+                    result = await backend.run(
+                        retry_prompt, workspace, log_cb,
+                        inject_queue=inject_queues.get(task_id),
+                    )
+                    if result.spent_tokens:
+                        total_tokens_spent += result.spent_tokens
+
+                    # Per-attempt telemetry row.
+                    attempt_class = (
+                        None if result.ok
+                        else classify_failure(result.summary, result.error)
+                    )
+                    await client.append_run(task_id, "backend_attempt", {
+                        "backend": backend_id,
+                        "retry_idx": retry_idx,
+                        "chain_position": backend_idx,
+                        "ok": result.ok,
+                        "classification": attempt_class,
+                        "tokens_spent": result.spent_tokens or 0,
+                        "tokens_cumulative": total_tokens_spent,
+                    })
+
+                    if result.ok:
+                        break
+                    last_failure_summary = result.summary or ""
+                    # If the failure isn't retryable (rate_limited /
+                    # auth_error), abandon same-backend retries and try
+                    # the next backend in the chain.
+                    if not is_retryable(attempt_class or "unknown"):
+                        break
+
+                if result and result.ok:
+                    break  # success — leave the chain loop too
+
+            # `result` is guaranteed non-None: every chain iteration sets
+            # it, and the chain has at least one entry.
 
             # 3. Self-healing loop - run tests; retry backend on failure
             # Detect refactor / migrate / big-change tasks for regression coverage
