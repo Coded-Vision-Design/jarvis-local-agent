@@ -204,3 +204,49 @@ def test_remote_default_branch_resolves_master(patched_settings, tmp_path):
     target = settings.workspace_root / "workspaces" / repo
     _run(["git", "clone", bare.as_uri(), str(target)])
     assert runner._remote_default_branch(target) == "master"
+
+
+def test_fetch_128_retries_after_origin_refresh(patched_settings, tmp_path, monkeypatch):
+    """Stale PAT in origin URL must not block the task on the first 128.
+
+    Reproduces the 09:29 test-website failure mode: fetch dies with 128
+    when origin still embeds a revoked token, even though the current env
+    token is fine. The runner should refresh origin and retry fetch before
+    nuking the workspace.
+    """
+    repo = "demo-fetch-retry"
+    bare = _make_bare(patched_settings, repo)
+    _seed_bare(bare, "main")
+
+    target = settings.workspace_root / "workspaces" / repo
+    _run(["git", "clone", bare.as_uri(), str(target)])
+
+    fetch_calls = {"n": 0}
+    real_sh = runner._sh
+
+    def fake_sh(cmd, cwd=None, check=True):
+        if cmd[:3] == ["git", "fetch", "--prune"]:
+            fetch_calls["n"] += 1
+            if fetch_calls["n"] == 1:
+                raise subprocess.CalledProcessError(
+                    128,
+                    cmd,
+                    "",
+                    "fatal: Authentication failed",
+                )
+        return real_sh(cmd, cwd=cwd, check=check)
+
+    monkeypatch.setattr(runner, "_sh", fake_sh)
+
+    out = runner._git_clone_or_fetch(repo)
+
+    assert out == target
+    assert fetch_calls["n"] == 2
+    head = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=str(target),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert head == "main"

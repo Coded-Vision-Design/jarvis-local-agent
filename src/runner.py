@@ -358,8 +358,7 @@ def _create_private_repo(repo: str, target: Path) -> Path:
         # against "name already exists" and the empty-remote self-heal in
         # `_git_clone_or_fetch` handles the rest).
         log.warning("private repo bootstrap failed for %s — nuking workspace", repo)
-        if target.exists():
-            shutil.rmtree(target, ignore_errors=True)
+        _nuke_workspace(target)
         raise
 
     # Register so future tasks can run against it
@@ -375,6 +374,22 @@ def _create_private_repo(repo: str, target: Path) -> Path:
     return target
 
 
+def _github_write_token() -> str | None:
+    """Token for HTTPS git/gh against Coded-Vision-Design org repos."""
+    for key in ("JARVIS_AGENT_REPO_WRITE_TOKEN", "GITHUB_TOKEN"):
+        tok = (os.environ.get(key) or "").strip()
+        if tok:
+            return tok
+    # Container often has `gh auth login` but a missing compose env var.
+    try:
+        r = _sh(["gh", "auth", "token"], check=False)
+        if r.returncode == 0 and (r.stdout or "").strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
 def _origin_url(repo: str) -> str:
     """Prefer HTTPS with the PAT baked in over SSH.
 
@@ -382,12 +397,38 @@ def _origin_url(repo: str) -> str:
     deploy key that's been added to the org. The container often only
     has one or the other; HTTPS is the safer default. The fine-grained
     JARVIS_AGENT_REPO_WRITE_TOKEN is preferred when present (it has
-    repo + admin:org grants); otherwise fall back to GITHUB_TOKEN.
+    repo + admin:org grants); otherwise fall back to GITHUB_TOKEN, then
+    ``gh auth token``.
     """
-    token = os.environ.get("JARVIS_AGENT_REPO_WRITE_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    token = _github_write_token()
     if token:
         return f"https://x-access-token:{token}@github.com/{GITHUB_ORG}/{repo}.git"
     return f"git@github.com:{GITHUB_ORG}/{repo}.git"
+
+
+def _refresh_origin_url(workspace: Path, repo: str) -> None:
+    """Rewrite origin to the current PAT-backed HTTPS URL."""
+    url = _origin_url(repo)
+    _sh(["git", "remote", "set-url", "origin", url], cwd=workspace)
+
+
+def _nuke_workspace(target: Path) -> None:
+    """Remove a workspace directory (Windows bind-mount safe).
+
+    ``shutil.rmtree(..., ignore_errors=True)`` can leave a half-deleted
+    tree on NTFS bind mounts; the next ``git clone`` into the same path
+    then fails and surfaces as fetch/clone exit 128. Rename-aside first
+    so clone always gets a clean directory name.
+    """
+    if not target.exists():
+        return
+    trash = target.parent / f".trash-{target.name}-{int(time.time())}"
+    try:
+        target.rename(trash)
+    except OSError:
+        shutil.rmtree(target, ignore_errors=True)
+        return
+    shutil.rmtree(trash, ignore_errors=True)
 
 
 def _remote_default_branch(workspace: Path) -> str | None:
@@ -455,8 +496,7 @@ def _git_clone_or_fetch(repo: str, create_if_missing: bool = False) -> Path:
     url = _origin_url(repo)
 
     def _fresh_clone() -> Path:
-        if target.exists():
-            shutil.rmtree(target, ignore_errors=True)
+        _nuke_workspace(target)
         try:
             _sh(["git", "clone", url, str(target)])
         except subprocess.CalledProcessError as exc:
@@ -472,28 +512,39 @@ def _git_clone_or_fetch(repo: str, create_if_missing: bool = False) -> Path:
     if not (target / ".git").exists():
         return _fresh_clone()
 
-    # Refresh origin URL so a previously-cloned SSH workspace still
-    # works after we flipped the default to HTTPS-with-PAT.
-    try:
-        _sh(["git", "remote", "set-url", "origin", url], cwd=target)
-    except subprocess.CalledProcessError:
-        # Not fatal — fetch will surface the real error below.
-        pass
+    # Refresh origin so stale PATs baked into the URL from an earlier run
+    # cannot survive a token rotation in .env.
+    _refresh_origin_url(target, repo)
+
+    def _fetch_origin() -> None:
+        _sh(["git", "fetch", "--prune", "origin"], cwd=target)
 
     try:
-        _sh(["git", "fetch", "--prune", "origin"], cwd=target)
+        _fetch_origin()
     except subprocess.CalledProcessError as exc:
-        # Exit 128 on fetch usually means stale auth / moved remote /
-        # corrupted .git. Nuke + re-clone is the cheap fix; the next
-        # task can resume cleanly.
+        # Exit 128 on fetch usually means stale auth embedded in origin,
+        # revoked PAT, or a corrupted .git. Refresh origin from current
+        # env/gh and retry once before the heavier re-clone path.
         if exc.returncode == 128:
             log.warning(
-                "git fetch exit 128 in %s — re-cloning from scratch (stderr=%s)",
+                "git fetch exit 128 in %s (stderr=%s) — refreshing origin and retrying",
                 target,
                 (exc.stderr or "")[:240],
             )
-            return _fresh_clone()
-        raise
+            _refresh_origin_url(target, repo)
+            try:
+                _fetch_origin()
+            except subprocess.CalledProcessError as exc2:
+                if exc2.returncode == 128:
+                    log.warning(
+                        "git fetch still exit 128 after origin refresh — re-cloning "
+                        "(stderr=%s)",
+                        (exc2.stderr or "")[:240],
+                    )
+                    return _fresh_clone()
+                raise
+        else:
+            raise
 
     default_branch = _remote_default_branch(target)
 

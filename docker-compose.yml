@@ -30,6 +30,8 @@ services:
       GIT_SSH_COMMAND: "ssh -F /dev/null -i /root/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null"
       # GitHub token for private repo creation and gh CLI in the health loop
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # Fine-grained PAT with Contents+Admin on Coded-Vision-Design (preferred for git HTTPS)
+      JARVIS_AGENT_REPO_WRITE_TOKEN: ${JARVIS_AGENT_REPO_WRITE_TOKEN:-}
       # Proactive health loop (set HEALTH_LOOP_ENABLED=true to enable)
       HEALTH_LOOP_ENABLED: ${HEALTH_LOOP_ENABLED:-false}
       HEALTH_CHECK_INTERVAL_SECONDS: ${HEALTH_CHECK_INTERVAL_SECONDS:-600}
