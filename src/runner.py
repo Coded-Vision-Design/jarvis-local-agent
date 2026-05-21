@@ -934,6 +934,37 @@ def _detect_build_output(workspace: Path) -> Path | None:
     return None
 
 
+async def _probe_deployed_url(url: str) -> tuple[bool, str]:
+    """GET the deployed URL and confirm it's a real, non-stub page.
+
+    Returns (ok, reason). Mirrors the cloud-side gate's
+    probeDeployedSite check so the workstation can fail fast on a
+    broken deploy instead of letting the task slip through to done.
+    Fail-closed: any 4xx/5xx, body < 800 bytes, or presence of the
+    scaffold placeholder marker = (False, reason).
+    """
+    import httpx
+
+    if not url or not url.startswith(("http://", "https://")):
+        return (False, "invalid_url")
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as c:
+            r = await c.get(
+                url,
+                headers={"User-Agent": "CDVJarvis-WorkstationProbe/1.0"},
+            )
+        if r.status_code != 200:
+            return (False, f"http {r.status_code}")
+        body = r.text
+        if len(body) < 800:
+            return (False, f"body only {len(body)} bytes — likely empty placeholder")
+        if "jarvis-scaffold-placeholder" in body:
+            return (False, "page is still the Jarvis pre-scaffold stub — Claude did not replace it")
+        return (True, f"200 OK ({len(body)} bytes)")
+    except Exception as exc:  # network, TLS, timeout — caller treats as fail
+        return (False, f"probe error: {type(exc).__name__}: {str(exc)[:200]}")
+
+
 def _looks_like_web_project(workspace: Path) -> bool:
     """Heuristic: does this workspace look like a website / web app?"""
     pkg = workspace / "package.json"
@@ -1807,7 +1838,64 @@ async def run_job(task: dict[str, Any]) -> None:
                     client, task_id, workspace, str(repo), branch, metadata,
                 )
                 deploy_url = deploy_outcome.url
+                # Hard-block on build_failed / deploy_failed even when a
+                # PR was opened — previously the runner kept marching to
+                # status=done because the PR satisfied the "shipped
+                # artefact" check. A broken deploy with a green PR is
+                # still a broken task; the operator's view of "done"
+                # should mean "the site is live", not "the diff exists".
+                if deploy_outcome.failure:
+                    await client.append_run(task_id, "error", error_run_payload(
+                        reason=deploy_outcome.failure,
+                        message=(
+                            f"Build/deploy failed ({deploy_outcome.failure}). "
+                            "PR may exist but the site is not live; not marking done."
+                        ),
+                    ))
+                    await write_handover("blocked", artefacts={
+                        "pr_url": pr_url,
+                        "branch": branch,
+                        "failure": deploy_outcome.failure,
+                    })
+                    await client.set_status(task_id, "blocked")
+                    await post_as_jarvis(
+                        f"⚠️ Task #{task_id} blocked — {deploy_outcome.failure} "
+                        f"(PR may exist but deploy did not land)"
+                    )
+                    return
                 if deploy_url:
+                    # Workstation-side post-deploy probe: a 200 with
+                    # non-trivial content before we say done. Catches
+                    # rsync-success-but-nginx-misconfigured AND empty
+                    # build output that got deployed. The cloud-side
+                    # gate also probes, but we'd rather fail here so
+                    # the operator sees the diagnosis in the workstation
+                    # activity log alongside the deploy step.
+                    probe_ok, probe_reason = await _probe_deployed_url(deploy_url)
+                    await client.append_run(task_id, "jarvis_note", {
+                        "message": (
+                            f"post-deploy probe: {'✓' if probe_ok else '✗'} {probe_reason}"
+                        ),
+                        "deploy_url": deploy_url,
+                        "probe_ok": probe_ok,
+                    })
+                    if not probe_ok:
+                        await client.append_run(task_id, "error", error_run_payload(
+                            reason="deploy_unreachable",
+                            message=f"Deployed URL probe failed: {probe_reason}",
+                        ))
+                        await write_handover("blocked", artefacts={
+                            "pr_url": pr_url,
+                            "branch": branch,
+                            "deploy_url": deploy_url,
+                            "probe_reason": probe_reason,
+                        })
+                        await client.set_status(task_id, "blocked")
+                        await post_as_jarvis(
+                            f"⚠️ Task #{task_id} blocked — deploy URL probe failed: "
+                            f"{probe_reason[:200]}"
+                        )
+                        return
                     await _record_deliverable_links(
                         client,
                         task_id,

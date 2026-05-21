@@ -13,6 +13,14 @@ from .base import Backend, BackendResult
 
 log = logging.getLogger("jarvis-agent.backend.claude")
 
+# Hard ceiling on time between consecutive stdout lines. Claude Opus can
+# take 30-120s of extended thinking before the first token but never more
+# than a couple of minutes between subsequent lines once it's streaming.
+# Without a ceiling we've seen the subprocess die silently (network blip,
+# host kill, OOM) and leave the runner blocked on readline forever, the
+# task stuck in_progress until the cloud reaper marks it stale.
+CLAUDE_READLINE_TIMEOUT_S = float(os.environ.get("CLAUDE_READLINE_TIMEOUT_S", "300"))
+
 
 async def _inject_watcher(
     proc: asyncio.subprocess.Process,
@@ -156,9 +164,33 @@ class ClaudeBackend(Backend):
 
         captured: list[str] = []
         spent_tokens_total = 0
+        timed_out = False
 
         assert proc.stdout is not None
-        async for raw in proc.stdout:
+        while True:
+            try:
+                raw = await asyncio.wait_for(
+                    proc.stdout.readline(),
+                    timeout=CLAUDE_READLINE_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                # Subprocess hasn't produced a line in CLAUDE_READLINE_TIMEOUT_S.
+                # The CLI is either hung on a slow API call, dead, or OOM'd by
+                # the host. Kill it so the runner can mark the task blocked
+                # with a real reason instead of heartbeating forever.
+                log.warning(
+                    "claude readline timeout after %.0fs — killing subprocess (captured=%d lines)",
+                    CLAUDE_READLINE_TIMEOUT_S,
+                    len(captured),
+                )
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                timed_out = True
+                break
+            if not raw:
+                break
             line = raw.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
@@ -183,6 +215,10 @@ class ClaudeBackend(Backend):
                 await log_cb("terminal_line", {"line": line[:2000]})
 
         rc = await proc.wait()
+        # Surface the timeout as a non-zero rc so the caller's normal
+        # "rc != 0 → blocked" path fires.
+        if timed_out and rc == 0:
+            rc = 124
 
         if watcher_task is not None:
             watcher_task.cancel()
@@ -344,6 +380,18 @@ class ClaudeBackend(Backend):
                 ok=False,
                 summary=f"claude-code exited {rc}",
                 error=(stderr_text or full_log)[-1800:],
+                spent_tokens=spent_tokens_total or None,
+            )
+        # Exit 0 with no captured output = silent death (subprocess
+        # vanished without writing any stream-json events). Mark this
+        # as a failure so the runner blocks instead of treating zero
+        # progress as success. Previously this slipped through as
+        # ok=True and the task marked done with an empty summary.
+        if len(captured) == 0:
+            return BackendResult(
+                ok=False,
+                summary="claude-code exited cleanly but produced no output",
+                error=(stderr_text or "no stdout captured")[-1800:],
                 spent_tokens=spent_tokens_total or None,
             )
         return BackendResult(
