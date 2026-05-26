@@ -3,15 +3,20 @@
 Endpoints accept paths from the cloud (image_path, apk_path, ...). Without a
 guard, a crafted value like ``../../etc/passwd`` lets a caller read arbitrary
 files (the vision backend base64-encodes the bytes into its reply). Every such
-path must pass through :func:`safe_local_path`, which resolves symlinks/``..``
-and rejects anything that escapes the allowed roots.
+path must pass through :func:`safe_local_path`, which sanitises the input,
+resolves symlinks/``..`` and rejects anything that escapes the allowed roots.
 """
 from __future__ import annotations
 
+import os
+import re
 import tempfile
 from pathlib import Path
 
 from .config import settings
+
+_MAX_PATH_LEN = 4096
+_FORBIDDEN_PATTERNS = re.compile(r"[\x00-\x1f]|^\\\\|^//")
 
 
 def _allowed_roots() -> list[Path]:
@@ -30,16 +35,30 @@ def _allowed_roots() -> list[Path]:
     return resolved
 
 
+def _sanitise(raw: str | Path) -> str:
+    """Reject obviously hostile input before any filesystem call."""
+    s = os.fspath(raw)
+    if not s or len(s) > _MAX_PATH_LEN:
+        raise ValueError("path empty or too long")
+    if _FORBIDDEN_PATTERNS.search(s):
+        raise ValueError("path contains forbidden characters")
+    return s
+
+
 def safe_local_path(raw: str | Path) -> Path:
     """Resolve ``raw`` and confine it to an allowed root.
 
     Returns the resolved :class:`~pathlib.Path` on success. Raises
     :class:`ValueError` if the path is malformed or escapes every allowed root.
+    The returned Path is guaranteed to be inside one of the allowed roots and
+    safe for downstream filesystem operations.
     """
-    resolved = Path(raw).resolve()
+    s = _sanitise(raw)
+    resolved = Path(s).resolve()
     for root in _allowed_roots():
         try:
-            if resolved == root or resolved.is_relative_to(root):
+            common = os.path.commonpath([str(resolved), str(root)])
+            if common == str(root):
                 return resolved
         except ValueError:
             # Different drive on Windows -> not under this root.

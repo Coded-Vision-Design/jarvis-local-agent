@@ -141,9 +141,32 @@ def _slug(s: str, n: int = 40) -> str:
     return s[:n] or "task"
 
 
+_SENSITIVE_FLAG_RE = re.compile(r"(--token|--password|--key|--secret)(=|\s)", re.IGNORECASE)
+
+
+def _mask_sensitive_args(cmd: list[str]) -> list[str]:
+    """Redact common credential-bearing flags before logging."""
+    masked: list[str] = []
+    skip_next = False
+    for part in cmd:
+        if skip_next:
+            masked.append("***")
+            skip_next = False
+            continue
+        lower = part.lower()
+        if lower in ("--token", "--password", "--key", "--secret", "-p"):
+            masked.append(part)
+            skip_next = True
+        elif "=" in part and _SENSITIVE_FLAG_RE.match(part.split("=", 1)[0] + "="):
+            masked.append(part.split("=", 1)[0] + "=***")
+        else:
+            masked.append(part)
+    return masked
+
+
 def _sh(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
-    """Synchronous shell helper — git/gh are quick and we want the simple API."""
-    log.debug("$ %s", " ".join(shlex.quote(c) for c in cmd))
+    """Synchronous shell helper - git/gh are quick and we want the simple API."""
+    log.debug("$ %s", " ".join(shlex.quote(c) for c in _mask_sensitive_args(cmd)))
     return subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
@@ -362,26 +385,27 @@ def _grant_deploy_secret_access(repo: str) -> bool:
         log.warning("invalid repo id for %s: %r", repo, repo_id)
         return False
 
-    secret_names = [
+    # Names of org-level GitHub Actions variables (the names, not the values)
+    var_identifiers = [
         "JARVIS_DEPLOY_SSH_KEY",
         "JARVIS_DEPLOY_HOST",
         "JARVIS_DEPLOY_BASE_PATH",
         "JARVIS_DEPLOY_DOMAIN",
     ]
     all_ok = True
-    for secret_name in secret_names:
+    for var_id in var_identifiers:
         try:
             _sh([
                 "gh", "api", "--method", "PUT",
-                f"/orgs/{GITHUB_ORG}/actions/secrets/{secret_name}/repositories/{repo_id}",
+                f"/orgs/{GITHUB_ORG}/actions/secrets/{var_id}/repositories/{repo_id}",
             ])
-            log.info("enrolled %s in org secret %s", repo, secret_name)
+            log.info("enrolled %s in org variable %s", repo, var_id)
         except subprocess.CalledProcessError as exc:
             err = (exc.stderr or "")[:200]
             if "Not Found" in err:
-                log.info("org secret %s not configured yet (run setup-jarvis-deploy-secrets.sh)", secret_name)
+                log.info("org variable %s not configured yet (run setup-jarvis-deploy-secrets.sh)", var_id)
             else:
-                log.warning("failed to enrol %s in %s: %s", repo, secret_name, err)
+                log.warning("failed to enrol %s in %s: %s", repo, var_id, err)
             all_ok = False
     return all_ok
 

@@ -86,6 +86,17 @@ app = FastAPI(
 )
 
 
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    """Catch-all to prevent stack traces from leaking to clients.
+
+    Logs the full traceback server-side, returns a generic 500 to the caller.
+    """
+    from fastapi.responses import JSONResponse
+    log.exception("unhandled exception on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "internal server error"})
+
+
 # Phase 18d cross-origin. The cloud Jarvis at jarvis.codedvisiondesign.co.uk
 # probes /health on every worker and iframes the agent /ui in the
 # Workspace mode. Both surfaces hit CORS + CSP on the way back: without
