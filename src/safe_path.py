@@ -48,19 +48,22 @@ def _sanitise(raw: str | Path) -> str:
 def safe_local_path(raw: str | Path) -> Path:
     """Resolve ``raw`` and confine it to an allowed root.
 
-    Returns the resolved :class:`~pathlib.Path` on success. Raises
-    :class:`ValueError` if the path is malformed or escapes every allowed root.
-    The returned Path is guaranteed to be inside one of the allowed roots and
-    safe for downstream filesystem operations.
+    Returns a :class:`~pathlib.Path` rebuilt from a trusted root + the relative
+    portion of the resolved input. Raises :class:`ValueError` if the path is
+    malformed or escapes every allowed root. The returned Path is guaranteed to
+    be inside one of the allowed roots and safe for downstream filesystem
+    operations - CodeQL recognises ``Path.relative_to`` followed by rebuilding
+    from the trusted root as a sanitiser for path-injection.
     """
     s = _sanitise(raw)
-    resolved = Path(s).resolve()
+    resolved = Path(s).resolve(strict=False)
     for root in _allowed_roots():
         try:
-            common = os.path.commonpath([str(resolved), str(root)])
-            if common == str(root):
-                return resolved
+            rel = resolved.relative_to(root)
         except ValueError:
-            # Different drive on Windows -> not under this root.
             continue
+        # Rebuild from the *trusted* root so downstream usages operate on a
+        # path whose parent chain is statically known to be inside `root`.
+        safe = root.joinpath(*rel.parts)
+        return safe
     raise ValueError(f"path outside allowed roots: {raw!r}")
