@@ -3,15 +3,17 @@
 Endpoints accept paths from the cloud (image_path, apk_path, ...). Without a
 guard, a crafted value like ``../../etc/passwd`` lets a caller read arbitrary
 files (the vision backend base64-encodes the bytes into its reply). Every such
-path must pass through :func:`safe_local_path`, which sanitises the input,
-resolves symlinks/``..`` and rejects anything that escapes the allowed roots.
+path must pass through :func:`safe_local_path`, which validates the input at
+the string level and rebuilds the path from a trusted root - never invoking
+any filesystem operation (``Path.resolve``, ``os.path.realpath``, ...) on the
+raw value.
 """
 from __future__ import annotations
 
 import os
 import re
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePath
 
 from .config import settings
 
@@ -46,24 +48,36 @@ def _sanitise(raw: str | Path) -> str:
 
 
 def safe_local_path(raw: str | Path) -> Path:
-    """Resolve ``raw`` and confine it to an allowed root.
+    """Validate ``raw`` and rebuild it under an allowed root.
 
-    Returns a :class:`~pathlib.Path` rebuilt from a trusted root + the relative
-    portion of the resolved input. Raises :class:`ValueError` if the path is
-    malformed or escapes every allowed root. The returned Path is guaranteed to
-    be inside one of the allowed roots and safe for downstream filesystem
-    operations - CodeQL recognises ``Path.relative_to`` followed by rebuilding
-    from the trusted root as a sanitiser for path-injection.
+    The tainted input is never passed to a filesystem-touching operation. We
+    normalise the string with :func:`os.path.normpath`, reject any residual
+    ``..`` segment, then confirm containment with :func:`os.path.commonpath`
+    (the CodeQL-recognised sanitiser for path-injection). The returned
+    :class:`~pathlib.Path` is built from the trusted, pre-resolved root plus
+    only the validated suffix components.
     """
     s = _sanitise(raw)
-    resolved = Path(s).resolve(strict=False)
+    if not os.path.isabs(s):
+        raise ValueError("path must be absolute")
+
+    # Pure string normalisation - no filesystem access on tainted input.
+    norm = os.path.normpath(s)
+    pure_parts = PurePath(norm).parts
+    if any(part == ".." for part in pure_parts):
+        raise ValueError("path traversal not allowed")
+
     for root in _allowed_roots():
+        root_str = str(root)
         try:
-            rel = resolved.relative_to(root)
+            common = os.path.commonpath([norm, root_str])
         except ValueError:
+            # Different drives on Windows - cannot share a common path.
             continue
-        # Rebuild from the *trusted* root so downstream usages operate on a
-        # path whose parent chain is statically known to be inside `root`.
-        safe = root.joinpath(*rel.parts)
-        return safe
+        if common != root_str:
+            continue
+        # Rebuild from the *trusted* root with only the vetted suffix parts.
+        suffix_parts = pure_parts[len(PurePath(root_str).parts):]
+        return root.joinpath(*suffix_parts)
+
     raise ValueError(f"path outside allowed roots: {raw!r}")
