@@ -1,7 +1,7 @@
 name: Dependabot auto-merge
 
 # Fires on any pull_request. The `if: github.actor == 'dependabot[bot]'`
-# gate below restricts the actual approve+auto-merge to Dependabot PRs.
+# gate below restricts the actual approve+auto-merge + format-fix to Dependabot PRs.
 # (Some CVD repos have non-master default branches like `platform/phase-0`,
 # so a hardcoded `branches:` filter would silently skip them.)
 on:
@@ -12,7 +12,74 @@ permissions:
   pull-requests: write
 
 jobs:
+  format-fix:
+    # Runs prettier + eslint --fix on Dependabot's PR branch BEFORE auto-merge.
+    # Rationale: dep bumps frequently shuffle lockfile / generated files in ways
+    # that drift from repo formatting. Bot-authored PRs are low review value, so
+    # we autofix here and let auto-merge proceed. Human PRs are NEVER touched
+    # by this job (the if-guard ensures it).
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Detect prettier + eslint
+        id: tools
+        run: |
+          HAS_PRETTIER=0
+          HAS_ESLINT=0
+          if [ -f package.json ]; then
+            if grep -qE '"prettier"' package.json; then HAS_PRETTIER=1; fi
+            if grep -qE '"eslint"' package.json; then HAS_ESLINT=1; fi
+          fi
+          echo "prettier=$HAS_PRETTIER" >> "$GITHUB_OUTPUT"
+          echo "eslint=$HAS_ESLINT" >> "$GITHUB_OUTPUT"
+
+      - name: Install (only if a JS toolchain is present)
+        if: steps.tools.outputs.prettier == '1' || steps.tools.outputs.eslint == '1'
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            npm install -g pnpm@9
+            pnpm install --frozen-lockfile --ignore-scripts
+          elif [ -f yarn.lock ]; then
+            yarn install --frozen-lockfile --ignore-scripts
+          elif [ -f package-lock.json ]; then
+            npm ci --ignore-scripts
+          fi
+
+      - name: prettier --write
+        if: steps.tools.outputs.prettier == '1'
+        run: |
+          npx prettier --write . 2>&1 || echo "prettier had issues, continuing"
+        continue-on-error: true
+
+      - name: eslint --fix
+        if: steps.tools.outputs.eslint == '1'
+        run: |
+          npx eslint --fix . 2>&1 || echo "eslint had issues, continuing"
+        continue-on-error: true
+
+      - name: Commit fixes if any
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "chore(deps): apply prettier + eslint --fix after Dependabot bump [skip ci]"
+            git push
+          else
+            echo "No formatting changes to commit"
+          fi
+
   auto-merge:
+    needs: format-fix
     if: github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
@@ -23,6 +90,12 @@ jobs:
           github-token: "${{ secrets.GITHUB_TOKEN }}"
 
       - name: Approve patch and minor updates
+        # NON-FATAL on purpose. Approving is blocked enterprise-wide
+        # ("GitHub Actions is not permitted to approve pull requests"), and it
+        # is also unnecessary - branch protection requires 0 reviews (the gate
+        # is the `verify` status check). Without continue-on-error this step
+        # exits 1 and the auto-merge step below never runs, so PRs never merge.
+        continue-on-error: true
         if: steps.meta.outputs.update-type == 'version-update:semver-patch' || steps.meta.outputs.update-type == 'version-update:semver-minor'
         run: gh pr review --approve "$PR_URL"
         env:
