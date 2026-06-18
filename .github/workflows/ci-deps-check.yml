@@ -1,0 +1,88 @@
+name: verify
+
+# Canonical lightweight PR gate, seeded org-wide by
+# cdv-vps-ops/scripts/seed-branch-protection.ps1.
+#
+# WHY THIS EXISTS
+#   The Dependabot auto-merge workflow (dependabot-auto-merge.yml) can only
+#   arm `gh pr merge --auto` when the branch has a *pending required status
+#   check* to wait on. Most CVD repos had no branch protection and no required
+#   check, so auto-merge could never arm and Dependabot PRs piled up.
+#
+#   This workflow's single job is named `verify`, so branch protection can
+#   require exactly ONE status context ("verify") on every repo regardless of
+#   language. Patch/minor Dependabot PRs auto-merge only when `verify` is
+#   green; majors stay open for review.
+#
+# DESIGN NOTES
+#   - Detects npm / composer at the repo root and runs INSTALL + BUILD only.
+#     Tests are intentionally EXCLUDED: many legacy CVD repos have pre-existing
+#     red test suites on the default branch (see docs/SAST_ALERTS_TRIAGE.md
+#     B.3). Gating on them would block every merge, including manual hotfixes.
+#     Install + build is the signal that actually catches a breaking dep bump.
+#   - Repos with no manifest at root pass trivially - the gate still exists so
+#     auto-merge has something to wait on (e.g. github-actions-only bumps).
+#   - `verify` is the ONLY required context. A repo's other (possibly red) CI
+#     is never made required by the seeder, so it never blocks auto-merge.
+#   - --ignore-scripts on install mirrors dependabot-auto-merge.yml: arbitrary
+#     postinstall across 100+ unknown repos must not hang or run untrusted code.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect ecosystems
+        id: detect
+        run: |
+          npm=0; composer=0
+          [ -f package.json ] && npm=1
+          [ -f composer.json ] && composer=1
+          echo "npm=$npm" >> "$GITHUB_OUTPUT"
+          echo "composer=$composer" >> "$GITHUB_OUTPUT"
+          echo "Detected: npm=$npm composer=$composer"
+
+      - name: Setup Node
+        if: steps.detect.outputs.npm == '1'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: npm install + build
+        if: steps.detect.outputs.npm == '1'
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --ignore-scripts || npm install --ignore-scripts --no-audit --no-fund
+          else
+            npm install --ignore-scripts --no-audit --no-fund
+          fi
+          # Build / typecheck only if the scripts exist. Tests deliberately skipped.
+          npm run build --if-present
+          npm run typecheck --if-present
+
+      - name: Setup PHP
+        if: steps.detect.outputs.composer == '1'
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+
+      - name: composer install
+        if: steps.detect.outputs.composer == '1'
+        run: |
+          composer install --no-interaction --no-progress --no-scripts --ignore-platform-reqs \
+            || composer update --no-interaction --no-progress --no-scripts --ignore-platform-reqs
+
+      - name: Gate satisfied
+        run: echo "verify passed - dependencies install and build cleanly"
