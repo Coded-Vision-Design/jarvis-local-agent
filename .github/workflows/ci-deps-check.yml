@@ -28,6 +28,10 @@ name: verify
 #     postinstall across 100+ unknown repos must not hang or run untrusted code.
 
 on:
+  # push to the default branch so the workflow badge reflects default-branch
+  # status (pull_request runs alone leave the badge showing "no status").
+  push:
+    branches: [main, master]
   pull_request:
   workflow_dispatch:
 
@@ -60,17 +64,29 @@ jobs:
         with:
           node-version: "22"
 
-      - name: npm install + build
+      - name: Install + build
         if: steps.detect.outputs.npm == '1'
         run: |
-          if [ -f package-lock.json ]; then
-            npm ci --ignore-scripts || npm install --ignore-scripts --no-audit --no-fund
+          # Use the repo's own package manager: pnpm (incl. turbo monorepos)
+          # when a pnpm-lock.yaml is present, otherwise npm. Install used
+          # --ignore-scripts, so Prisma's postinstall `generate` is skipped;
+          # run it explicitly when a schema exists or `next build` fails with
+          # "Cannot find module .prisma/client". Tests deliberately skipped.
+          if [ -f pnpm-lock.yaml ]; then
+            corepack enable
+            pnpm install --no-frozen-lockfile --ignore-scripts
+            [ -f prisma/schema.prisma ] && pnpm exec prisma generate || true
+            pnpm run build --if-present
           else
-            npm install --ignore-scripts --no-audit --no-fund
+            if [ -f package-lock.json ]; then
+              npm ci --ignore-scripts || npm install --ignore-scripts --no-audit --no-fund
+            else
+              npm install --ignore-scripts --no-audit --no-fund
+            fi
+            [ -f prisma/schema.prisma ] && npx prisma generate || true
+            npm run build --if-present
+            npm run typecheck --if-present
           fi
-          # Build / typecheck only if the scripts exist. Tests deliberately skipped.
-          npm run build --if-present
-          npm run typecheck --if-present
 
       - name: Setup PHP
         if: steps.detect.outputs.composer == '1'
