@@ -6,4 +6,4 @@ pydantic==2.13.4
 pydantic-settings==2.14.2
 pyyaml==6.0.3
 # Phase 22 — WebSocket client for cloud->agent task push.
-websockets==14.1
+websockets==16.1.1
