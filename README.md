@@ -1,3 +1,10 @@
+<!-- BEGIN: cvd-org-header (auto-managed by scripts/inject-readme-header.ps1 in cdv-vps-ops; this block may be regenerated) -->
+
+[![CI](https://github.com/Coded-Vision-Design/jarvis-local-agent/actions/workflows/ci-deps-check.yml/badge.svg)](https://github.com/Coded-Vision-Design/jarvis-local-agent/actions/workflows/ci-deps-check.yml) [![CodeQL](https://img.shields.io/badge/CodeQL-scanning-2ea44f?style=flat-square&logo=github&logoColor=white)](https://github.com/Coded-Vision-Design/jarvis-local-agent/security/code-scanning) [![Built by Coded Vision Design](https://img.shields.io/badge/Built%20by-Coded%20Vision%20Design-111827?style=flat-square)](https://github.com/Coded-Vision-Design)
+
+Built and maintained by [Coded Vision Design](https://github.com/Coded-Vision-Design). [Security policy](https://github.com/Coded-Vision-Design/.github/blob/main/SECURITY.md) &middot; [Contributing](https://github.com/Coded-Vision-Design/.github/blob/main/CONTRIBUTING.md) &middot; [Code of conduct](https://github.com/Coded-Vision-Design/.github/blob/main/CODE_OF_CONDUCT.md)
+
+<!-- END: cvd-org-header -->
 # jarvis-local-agent
 
 The local sub-agent for delegated coding work. Runs on the Windows dev box, polls the Jarvis VPS for delegated tasks, and executes them across four backends (Claude, Qwen, Hermes, Smart) with self-healing tests, approval gates, and auto-deploy to wildcard subdomains.
