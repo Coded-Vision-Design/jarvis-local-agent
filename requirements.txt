@@ -3,7 +3,7 @@ uvicorn[standard]==0.52.1
 fastapi-mcp==0.4.0
 httpx==0.28.1
 pydantic==2.13.4
-pydantic-settings==2.14.2
+pydantic-settings==2.15.0
 pyyaml==6.0.3
 # Phase 22 — WebSocket client for cloud->agent task push.
 websockets==14.1
