@@ -1025,6 +1025,22 @@ async def _probe_deployed_url(url: str) -> tuple[bool, str]:
         return (False, f"probe error: {type(exc).__name__}: {str(exc)[:200]}")
 
 
+DEPLOY_OPT_OUT_MARKER = ".jarvis-no-deploy"
+
+
+def _deploy_opted_out(workspace: Path) -> bool:
+    """Repo-level opt-out from the VPS auto-deploy and README URL rewrite.
+
+    A repo that ships through its own pipeline (for example GitHub Actions
+    rsync to Hostinger shared hosting) commits an empty ``.jarvis-no-deploy``
+    file at its root. Jarvis then never builds, rsyncs or rewrites the README
+    for it, regardless of task metadata, so a task submitted without
+    ``local_agent_deploy: false`` cannot publish a duplicate copy of the site
+    under the slug-derived subdomain.
+    """
+    return (workspace / DEPLOY_OPT_OUT_MARKER).exists()
+
+
 def _looks_like_web_project(workspace: Path) -> bool:
     """Heuristic: does this workspace look like a website / web app?"""
     pkg = workspace / "package.json"
@@ -1083,6 +1099,7 @@ async def _build_and_deploy_web_task(
     should_deploy = (
         settings.deploy_enabled
         and metadata.get("local_agent_deploy", True) is not False
+        and not await asyncio.to_thread(_deploy_opted_out, workspace)
         and await asyncio.to_thread(_looks_like_web_project, workspace)
     )
     if not should_deploy:
@@ -2006,6 +2023,7 @@ async def run_job(task: dict[str, Any]) -> None:
             should_deploy = (
                 settings.deploy_enabled
                 and metadata.get("local_agent_deploy", True) is not False
+                and not await asyncio.to_thread(_deploy_opted_out, workspace)
                 and await asyncio.to_thread(_looks_like_web_project, workspace)
             )
             if should_deploy:
