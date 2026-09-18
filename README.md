@@ -88,6 +88,8 @@ Then follow [ROLLOUT.md](./ROLLOUT.md) for:
 
 When Jarvis creates a private repo via `local_agent_create_repo: true`, it adds the repo to `repos.yml` automatically.
 
+A repo that deploys through its own pipeline (for example GitHub Actions rsync to Hostinger) commits an empty `.jarvis-no-deploy` file at its root. Jarvis then never builds, rsyncs or rewrites the README URL for that repo, whatever the task metadata says. Tasks for such repos should still carry `local_agent_deploy: false` as belt and braces.
+
 ## Hive mind — propagating changes across workers
 
 A push to `main` that touches `Dockerfile`, `code-server.Dockerfile`,
